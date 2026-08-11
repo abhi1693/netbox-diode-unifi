@@ -81,6 +81,50 @@ def test_build_cable_entities_skips_existing_cabled_endpoint():
     assert entities == []
 
 
+def test_build_cable_entities_skips_duplicate_discovered_endpoint():
+    manufacturer = Manufacturer(name="Ubiquiti", slug="ubiquiti")
+    aggregation = Device(name="USW Pro Aggregation", device_type="USAGGPRO", manufacturer=manufacturer)
+    switch_a = Device(name="Switch A", device_type="USL24PB", manufacturer=manufacturer)
+    switch_b = Device(name="Switch B", device_type="USL24PB", manufacturer=manufacturer)
+
+    aggregation_iface = Interface(device=aggregation, name="SFP+ 1", type="10gbase-x-sfpp")
+    switch_a_iface = Interface(device=switch_a, name="SFP 1", type="1000base-x-sfp")
+    switch_b_iface = Interface(device=switch_b, name="SFP 1", type="1000base-x-sfp")
+
+    entities = build_cable_entities(
+        devices=[
+            {
+                "mac": "aa:aa:aa:aa:aa:aa",
+                "uplink": {
+                    "port_idx": 1,
+                    "uplink_mac": "cc:cc:cc:cc:cc:cc",
+                    "uplink_remote_port": 1,
+                },
+            },
+            {
+                "mac": "bb:bb:bb:bb:bb:bb",
+                "uplink": {
+                    "port_idx": 1,
+                    "uplink_mac": "cc:cc:cc:cc:cc:cc",
+                    "uplink_remote_port": 1,
+                },
+            },
+        ],
+        device_by_mac={
+            "aa:aa:aa:aa:aa:aa": switch_a,
+            "bb:bb:bb:bb:bb:bb": switch_b,
+            "cc:cc:cc:cc:cc:cc": aggregation,
+        },
+        port_by_device_mac_and_idx={
+            ("aa:aa:aa:aa:aa:aa", 1): switch_a_iface,
+            ("bb:bb:bb:bb:bb:bb", 1): switch_b_iface,
+            ("cc:cc:cc:cc:cc:cc", 1): aggregation_iface,
+        },
+    )
+
+    assert len(entities) == 1
+
+
 def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
     entities = build_device_entities(
         devices=[

@@ -707,6 +707,7 @@ def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device
 def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces=None):
     entities = []
     seen = set()
+    seen_interfaces = set()
     existing_cabled_interfaces = existing_cabled_interfaces or set()
     for device in devices:
         local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
@@ -731,6 +732,10 @@ def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, exi
             if local_key in existing_cabled_interfaces or remote_key in existing_cabled_interfaces:
                 print(f"skipping existing cabled link local={local_key!r} remote={remote_key!r}")
                 continue
+            if local_key in seen_interfaces or remote_key in seen_interfaces:
+                print(f"skipping duplicate discovered cabled link local={local_key!r} remote={remote_key!r}")
+                continue
+            seen_interfaces.update([local_key, remote_key])
             label = f"UniFi LLDP {local_device.name if local_device else local_mac} {local_iface.name} to {remote_device.name if remote_device else remote_mac} {remote_iface.name}"
             cable = Cable(
                 type="cat6" if interface_type_for(uplink).endswith("base-t") else "dac-active",
