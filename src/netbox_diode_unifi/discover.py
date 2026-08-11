@@ -494,11 +494,10 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
             name="eth0" if client.get("is_wired") else "wlan0",
             type="1000base-t" if client.get("is_wired") else "virtual",
             enabled=True,
-            parent=parent,
             speed=speed_kbps(client.get("wired_rate_mbps")),
             description="UniFi observed client attachment",
             tags=TAGS,
-            metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
+            metadata={"source": APP_NAME, "attached_to_parent_interface": bool(parent)},
         )
         entities.append(Entity(device=client_device))
         entities.append(Entity(interface=iface))
