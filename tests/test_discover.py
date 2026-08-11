@@ -1,4 +1,4 @@
-from netbox_diode_unifi.discover import build_entities, ip_with_mask, normalize_mac, slugify
+from netbox_diode_unifi.discover import build_device_entities, ip_with_mask, normalize_mac, slugify
 
 
 def entity_fields(entity):
@@ -11,32 +11,38 @@ def test_helpers_normalize_values():
     assert ip_with_mask("192.168.1.10") == "192.168.1.10/32"
 
 
-def test_build_entities_assigns_device_ip_to_management_interface():
-    entities = build_entities(
-        sites=[{"id": "site1"}],
+def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
+    entities = build_device_entities(
         devices=[
             {
-                "id": "dev1",
+                "_id": "dev1",
                 "name": "AP Test",
                 "model": "U7-Pro",
-                "macAddress": "AA:BB:CC:DD:EE:FF",
-                "ipAddress": "192.168.1.10",
-                "state": "ONLINE",
-                "firmwareVersion": "1.0.0",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "192.168.1.10",
+                "state": 1,
+                "version": "1.0.0",
+                "type": "uap",
+                "uplink": {
+                    "port_idx": 1,
+                    "name": "eth0",
+                    "type": "wire",
+                    "speed": 1000,
+                    "uplink_mac": "11:22:33:44:55:66",
+                    "uplink_remote_port": 12,
+                },
             }
         ],
         clients=[],
         networks=[],
+        wlans=[],
     )
 
-    assert [entity_fields(entity)[-1] for entity in entities] == [
-        "site",
-        "interface",
-        "ip_address",
-        "device",
-    ]
+    assert "interface" in [entity_fields(entity)[-1] for entity in entities]
+    assert "ip_address" in [entity_fields(entity)[-1] for entity in entities]
 
-    ip_entity = entities[2]
+    ip_entity = next(entity for entity in entities if "ip_address" in entity_fields(entity))
     assert ip_entity.ip_address.address == "192.168.1.10/32"
     assert ip_entity.ip_address.assigned_object_interface.name == "mgmt"
     assert ip_entity.ip_address.assigned_object_interface.device.name == "AP Test"
+    assert ip_entity.ip_address.assigned_object_interface.parent.name == "eth0"
