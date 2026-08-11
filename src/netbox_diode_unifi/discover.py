@@ -6,6 +6,7 @@ import os
 import re
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -29,6 +30,8 @@ from netboxlabs.diode.sdk.ingester import (
     Prefix,
     Provider,
     Site,
+    Tunnel,
+    TunnelGroup,
     VLAN,
     WirelessLAN,
 )
@@ -42,6 +45,14 @@ UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
 SENSITIVE_LOG_KEYS = {"token", "api_key", "authorization", "password", "client_secret"}
 NETBOX_BRANCH_HEADER = "X-NetBox-Branch"
 _NETBOX_BRANCH_HEADER_VALUE = None
+DEFAULT_UNIFI_VPN_ENDPOINTS = [
+    "/api/s/{site}/rest/vpn",
+    "/api/s/{site}/rest/vpnconfig",
+    "/api/s/{site}/rest/wireguard",
+    "/api/s/{site}/rest/ipsecvpn",
+    "/v2/api/site/{site}/vpn",
+    "/v2/api/site/{site}/wireguard",
+]
 UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME = {
     "U6ENT": "U6 Enterprise",
     "UAPL6": "U6+",
@@ -316,6 +327,51 @@ def unifi_get(api_key, path, params=None):
         raise
 
 
+def unifi_get_optional(api_key, path, params=None):
+    started = time.monotonic()
+    host = os.environ["UNIFI_HOST"].rstrip("/")
+    base_path = os.getenv("UNIFI_API_BASE_PATH", "/proxy/network").rstrip("/")
+    verify_tls = os.getenv("UNIFI_VERIFY_TLS", "false").lower() == "true"
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    url = f"{host}{base_path}{path}{query}"
+    headers = {"X-API-Key": api_key, "Accept": "application/json"}
+    req = urllib.request.Request(url, headers=headers)
+    ctx = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
+    log_event("unifi_optional_request_start", method="GET", path=path, params=params or {}, verify_tls=verify_tls)
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            body = resp.read()
+            log_event(
+                "unifi_optional_request_succeeded",
+                method="GET",
+                path=path,
+                status=resp.status,
+                bytes=len(body),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
+            return json.loads(body)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {400, 404, 405}:
+            log_event(
+                "unifi_optional_endpoint_unavailable",
+                path=path,
+                status=exc.code,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
+            return None
+        raise
+    except Exception as exc:
+        log_exception(
+            "unifi_optional_request_failed",
+            exc,
+            method="GET",
+            path=path,
+            params=params or {},
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        return None
+
+
 def netbox_branch_header_value(token):
     global _NETBOX_BRANCH_HEADER_VALUE
     if _NETBOX_BRANCH_HEADER_VALUE is not None:
@@ -474,6 +530,19 @@ def network_api_get(api_key, path):
     data = payload.get("data") or []
     log_event("unifi_api_data_loaded", path=path, item_count=len(data))
     return data
+
+
+def network_api_get_optional(api_key, path):
+    payload = unifi_get_optional(api_key, path)
+    if not payload:
+        return []
+    meta = payload.get("meta", {})
+    if meta.get("rc") not in (None, "ok"):
+        log_event("unifi_optional_endpoint_error_response", level="warning", path=path, meta=meta)
+        return []
+    data = payload.get("data") or []
+    log_event("unifi_optional_api_data_loaded", path=path, item_count=len(data))
+    return data if isinstance(data, list) else []
 
 
 def role_for_device(device):
@@ -876,6 +945,197 @@ def build_wan_circuit_entities(networks, home_site):
     return entities
 
 
+def configured_vpn_endpoint_paths(site_slug):
+    raw = os.getenv("UNIFI_VPN_ENDPOINTS")
+    templates = [item.strip() for item in raw.split(",") if item.strip()] if raw else DEFAULT_UNIFI_VPN_ENDPOINTS
+    return [template.format(site=site_slug) for template in templates]
+
+
+def collect_vpn_configs(api_key, site_slug):
+    configs = []
+    seen = set()
+    paths = configured_vpn_endpoint_paths(site_slug)
+    for path in paths:
+        for config in network_api_get_optional(api_key, path):
+            if not isinstance(config, dict):
+                continue
+            key = config.get("_id") or config.get("id") or config.get("external_id") or compact_json(config)
+            if key in seen:
+                continue
+            seen.add(key)
+            configs.append(config | {"_unifi_endpoint": path})
+    log_event("vpn_configs_loaded", endpoint_count=len(paths), item_count=len(configs))
+    return configs
+
+
+def first_present(data, keys):
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+def vpn_config_name(config):
+    return clean_name(
+        first_present(config, ["name", "display_name", "vpn_name", "connection_name", "description"]),
+        first_present(config, ["_id", "id", "external_id"]),
+        "UniFi VPN",
+    )
+
+
+def vpn_encapsulation(config):
+    raw = str(first_present(config, ["protocol", "vpn_type", "type", "method", "vpn_method", "connection_type"]) or "").lower()
+    if "wireguard" in raw or raw in {"wg", "wgvpn"}:
+        return "wireguard"
+    if "openvpn" in raw:
+        return "openvpn"
+    if "ipsec" in raw or "site-to-site" in raw or "s2s" in raw:
+        return "ipsec"
+    if "gre" in raw:
+        return "gre"
+    return raw or None
+
+
+def vpn_status(config):
+    if not config.get("enabled", True):
+        return "disabled"
+    raw = str(first_present(config, ["status", "state", "connection_status"]) or "").lower()
+    if raw in {"connected", "online", "up", "active", "1"}:
+        return "active"
+    if raw in {"disabled", "offline", "down", "disconnected"}:
+        return "disabled"
+    return "active"
+
+
+def values_from_maybe_list(value):
+    if value in (None, "", []):
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,\s]+", value) if part.strip()]
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            if isinstance(item, str):
+                result.extend(values_from_maybe_list(item))
+            elif isinstance(item, dict):
+                result.extend(values_from_maybe_list(first_present(item, ["subnet", "network", "cidr", "prefix", "address"])))
+        return result
+    if isinstance(value, dict):
+        return values_from_maybe_list(first_present(value, ["subnet", "network", "cidr", "prefix", "address"]))
+    return []
+
+
+def vpn_remote_prefix_values(config):
+    candidates = []
+    for key in [
+        "remote_subnets",
+        "remote_subnet",
+        "remote_networks",
+        "remote_network",
+        "remote_cidrs",
+        "remote_cidr",
+        "peer_subnets",
+        "peer_networks",
+    ]:
+        candidates.extend(values_from_maybe_list(config.get(key)))
+    prefixes = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            prefix = ipaddress.ip_network(candidate, strict=False)
+        except ValueError:
+            log_event("vpn_remote_prefix_skipped", level="warning", reason="invalid_prefix", value=candidate, vpn=vpn_config_name(config))
+            continue
+        key = str(prefix)
+        if key in seen:
+            continue
+        seen.add(key)
+        prefixes.append(key)
+    return prefixes
+
+
+def vpn_config_comments(config):
+    safe_keys = [
+        "_id",
+        "id",
+        "external_id",
+        "_unifi_endpoint",
+        "name",
+        "type",
+        "protocol",
+        "vpn_type",
+        "method",
+        "vpn_method",
+        "enabled",
+        "status",
+        "state",
+        "remote_ip",
+        "peer_ip",
+        "server",
+        "remote_subnets",
+        "remote_networks",
+        "local_subnets",
+        "local_networks",
+        "wan_networkgroup",
+        "networkgroup",
+        "site_id",
+    ]
+    return f"UniFi VPN details: {compact_json(filtered_metadata(config, safe_keys))}"
+
+
+def build_vpn_entities(vpn_configs):
+    if not vpn_configs:
+        log_event("vpn_entities_skipped", reason="no_vpn_configs")
+        return []
+
+    entities = []
+    group = TunnelGroup(
+        name="UniFi VPN",
+        slug="unifi-vpn",
+        description="VPN tunnels discovered from UniFi Network",
+        tags=TAGS,
+        metadata={"source": APP_NAME},
+    )
+    entities.append(Entity(tunnel_group=group))
+    seen_tunnels = set()
+    seen_prefixes = set()
+    for config in vpn_configs:
+        name = vpn_config_name(config)
+        if name in seen_tunnels:
+            continue
+        seen_tunnels.add(name)
+        tunnel = Tunnel(
+            name=name,
+            status=vpn_status(config),
+            group=group,
+            encapsulation=vpn_encapsulation(config),
+            description=f"UniFi VPN {name}",
+            comments=vpn_config_comments(config),
+            tags=TAGS,
+            metadata=filtered_metadata(config, ["_id", "id", "external_id", "_unifi_endpoint", "site_id"]) | {"source": APP_NAME},
+        )
+        entities.append(Entity(tunnel=tunnel))
+        for prefix_value in vpn_remote_prefix_values(config):
+            key = (name, prefix_value)
+            if key in seen_prefixes:
+                continue
+            seen_prefixes.add(key)
+            entities.append(
+                Entity(
+                    prefix=Prefix(
+                        prefix=prefix_value,
+                        status="active" if vpn_status(config) == "active" else "deprecated",
+                        description=f"UniFi VPN remote network for {name}",
+                        comments=vpn_config_comments(config),
+                        tags=TAGS,
+                        metadata=filtered_metadata(config, ["_id", "id", "external_id", "_unifi_endpoint", "site_id"]) | {"source": APP_NAME, "vpn": name},
+                    )
+                )
+            )
+    return entities
+
+
 def build_wireless_lan_entities(wlans, vlan_by_id, home_site):
     entities = []
     for wlan in wlans:
@@ -916,10 +1176,11 @@ def build_wireless_lan_entities(wlans, vlan_by_id, home_site):
     return entities
 
 
-def build_device_entities(devices, networks, clients=None, wlans=None):
+def build_device_entities(devices, networks, clients=None, wlans=None, vpn_configs=None):
     home_site = site()
     clients = clients or []
     wlans = wlans or []
+    vpn_configs = vpn_configs or []
     mgmt_prefixes = management_network_prefixes(networks)
     log_event(
         "management_network_detected",
@@ -932,6 +1193,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
     entities.extend(build_prefix_entities(networks, home_site))
     entities.extend(build_ip_range_entities(networks))
     entities.extend(build_wan_circuit_entities(networks, home_site))
+    entities.extend(build_vpn_entities(vpn_configs))
     entities.extend(build_wireless_lan_entities(wlans, vlan_by_id, home_site))
 
     device_by_mac = {}
@@ -1359,13 +1621,15 @@ def collect_entities(api_key):
     clients = network_api_get(api_key, f"/api/s/{site_slug}/stat/sta")
     networks = network_api_get(api_key, f"/api/s/{site_slug}/rest/networkconf")
     wlans = network_api_get(api_key, f"/api/s/{site_slug}/rest/wlanconf")
+    vpn_configs = collect_vpn_configs(api_key, site_slug)
     device_type_import = ensure_device_types(devices)
-    entities = build_device_entities(devices, networks, clients, wlans)
+    entities = build_device_entities(devices, networks, clients, wlans, vpn_configs)
     counts = {
         "devices": len(devices),
         "clients": len(clients),
         "networks": len(networks),
         "wlans": len(wlans),
+        "vpn_configs": len(vpn_configs),
         "entities": len(entities),
         "entity_types": entity_type_counts(entities),
         "device_type_import": device_type_import,

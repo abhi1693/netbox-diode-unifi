@@ -28,6 +28,10 @@ Optional environment variables:
 - `UNIFI_SECRET_KEY`, default `api-key`
 - `UNIFI_IMPORT_DEVICE_TYPES`, default `true`
 - `UNIFI_INCLUDE_CLIENT_DEVICES`, default `false`
+- `UNIFI_VPN_ENDPOINTS`, optional comma-separated UniFi VPN endpoint templates.
+  Templates may use `{site}` and default to the known legacy/v2 VPN collection
+  paths. Missing endpoints are skipped because UniFi exposes VPN data
+  differently across controller versions.
 - `DIODE_TARGET`, default `grpc://netbox-diode-ingress-nginx-controller.netbox.svc.cluster.local:80/diode`
 - `NETBOX_SITE_NAME`, default `Home`
 - `NETBOX_SITE_SLUG`, default `home`
@@ -45,6 +49,12 @@ accurate enough to avoid duplicate endpoint devices.
 
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.
+
+VPN data is modeled only when UniFi exposes explicit VPN configuration records.
+Discovered VPN records create a `UniFi VPN` tunnel group, tunnel objects, and
+remote network prefixes when remote CIDRs are present. If UniFi does not expose
+VPN collections, the collector logs the skipped optional endpoints and emits no
+VPN objects.
 
 ## Local validation
 

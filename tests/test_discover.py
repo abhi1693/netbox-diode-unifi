@@ -2,6 +2,7 @@ from netbox_diode_unifi.discover import (
     build_cable_entities,
     build_device_entities,
     build_ip_range_entities,
+    build_vpn_entities,
     ensure_device_types,
     ip_with_mask,
     log_event,
@@ -475,6 +476,37 @@ def test_build_ip_range_entities_skips_unifi_dhcp_range_outside_prefix(capsys):
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert logs[-1]["event"] == "ip_range_skipped"
     assert logs[-1]["reason"] == "dhcp_range_outside_prefix"
+
+
+def test_build_vpn_entities_adds_tunnel_and_remote_prefixes():
+    entities = build_vpn_entities(
+        [
+            {
+                "_id": "vpn1",
+                "name": "Office S2S",
+                "type": "ipsec",
+                "enabled": True,
+                "remote_ip": "203.0.113.10",
+                "remote_subnets": ["10.50.0.0/24", {"subnet": "10.60.0.0/24"}],
+                "_unifi_endpoint": "/api/s/default/rest/vpn",
+            }
+        ]
+    )
+
+    fields = [entity_fields(entity)[-1] for entity in entities]
+    assert fields == ["tunnel_group", "tunnel", "prefix", "prefix"]
+    assert entities[0].tunnel_group.name == "UniFi VPN"
+    assert entities[1].tunnel.name == "Office S2S"
+    assert entities[1].tunnel.encapsulation == "ipsec"
+    assert [entity.prefix.prefix for entity in entities[2:]] == ["10.50.0.0/24", "10.60.0.0/24"]
+
+
+def test_build_vpn_entities_skips_when_unifi_has_no_vpn_configs(capsys):
+    assert build_vpn_entities([]) == []
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert logs[-1]["event"] == "vpn_entities_skipped"
+    assert logs[-1]["reason"] == "no_vpn_configs"
 
 
 def test_build_device_entities_falls_back_to_first_valid_ip_without_default_network(capsys):
