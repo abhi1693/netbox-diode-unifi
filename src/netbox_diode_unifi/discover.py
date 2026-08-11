@@ -370,7 +370,6 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 description=f"UniFi port {port.get('port_idx')} {port.get('media') or ''} speed={port.get('speed') or 'unknown'} up={port.get('up')}",
                 mode="access" if native_vlan else None,
                 untagged_vlan=native_vlan,
-                mark_connected=bool(port.get("up") or port.get("last_connection", {}).get("connected")),
                 tags=TAGS,
                 metadata=filtered_metadata(
                     port,
@@ -403,7 +402,6 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 enabled=bool(uplink.get("up", True)),
                 speed=speed_kbps(uplink.get("speed") or uplink.get("max_speed")),
                 description="UniFi discovered uplink interface",
-                mark_connected=True,
                 tags=TAGS,
                 metadata=filtered_metadata(uplink, ["port_idx", "uplink_mac", "uplink_device_name", "uplink_remote_port"]) | {"source": APP_NAME},
             )
@@ -494,12 +492,11 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
         iface = Interface(
             device=client_device,
             name="eth0" if client.get("is_wired") else "wlan0",
-            type="1000base-t" if client.get("is_wired") else "ieee802.11ax",
+            type="1000base-t" if client.get("is_wired") else "virtual",
             enabled=True,
             parent=parent,
             speed=speed_kbps(client.get("wired_rate_mbps")),
             description="UniFi observed client attachment",
-            mark_connected=True,
             tags=TAGS,
             metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
         )
