@@ -4,7 +4,9 @@ from netbox_diode_unifi.discover import (
     ensure_device_types,
     ip_with_mask,
     log_event,
+    netbox_device_lookup,
     netbox_interface_key,
+    netbox_interface_is_cabled,
     netbox_auth_header,
     normalize_mac,
     slugify,
@@ -67,6 +69,59 @@ def test_ensure_device_types_uses_netbox_manufacturer_slug(monkeypatch):
     }
     assert calls == [
         ("GET", "/api/dcim/device-types/?manufacturer=ubiquiti&model=UDMPRO&limit=1", None, "nbt_example.secret")
+    ]
+
+
+def test_netbox_device_lookup_prefers_serial_before_name(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None):
+        calls.append(path)
+        if "serial=SER123" in path:
+            return {"results": [{"id": 42, "name": "Renamed Switch", "serial": "SER123"}]}
+        return {"results": []}
+
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert netbox_device_lookup("Old Switch", "SER123") == {"id": 42, "name": "Renamed Switch", "serial": "SER123"}
+    assert calls == ["/api/dcim/devices/?serial=SER123&limit=1"]
+
+
+def test_netbox_device_lookup_falls_back_to_name_when_serial_missing(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None):
+        calls.append(path)
+        if "name=Old+Switch" in path:
+            return {"results": [{"id": 43, "name": "Old Switch", "serial": ""}]}
+        return {"results": []}
+
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert netbox_device_lookup("Old Switch", "SER123") == {"id": 43, "name": "Old Switch", "serial": ""}
+    assert calls == [
+        "/api/dcim/devices/?serial=SER123&limit=1",
+        "/api/dcim/devices/?name=Old+Switch&limit=1",
+    ]
+
+
+def test_netbox_interface_cable_lookup_uses_serial_resolved_device_id(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None):
+        calls.append(path)
+        if path == "/api/dcim/devices/?serial=SER123&limit=1":
+            return {"results": [{"id": 42, "name": "Renamed Switch", "serial": "SER123"}]}
+        if path == "/api/dcim/interfaces/?device_id=42&name=SFP+1&limit=1":
+            return {"results": [{"id": 99, "name": "SFP 1", "cable": 10}]}
+        return {"results": []}
+
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert netbox_interface_is_cabled("Old Switch", "SFP 1", "SER123") is True
+    assert calls == [
+        "/api/dcim/devices/?serial=SER123&limit=1",
+        "/api/dcim/interfaces/?device_id=42&name=SFP+1&limit=1",
     ]
 
 

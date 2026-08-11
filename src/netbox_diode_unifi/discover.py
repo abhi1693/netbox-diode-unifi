@@ -565,6 +565,10 @@ def device_comments(device):
     return f"UniFi device details: {compact_json(filtered_metadata(device, keys))}"
 
 
+def device_serial(device):
+    return device.get("serial") or device.get("id") or device.get("_id")
+
+
 def make_device(device, home_site):
     mac = normalize_mac(device.get("mac") or device.get("macAddress"))
     model = clean_name(device.get("model"), "UniFi Device")
@@ -576,7 +580,7 @@ def make_device(device, home_site):
         platform=platform_for_device(device),
         manufacturer=UBIQUITI,
         site=home_site,
-        serial=device.get("serial") or device.get("id") or device.get("_id"),
+        serial=device_serial(device),
         status="active" if str(device.get("state", "")).upper() in {"ONLINE", "1"} or device.get("state") == 1 else "offline",
         description=f"UniFi {device.get('type') or 'device'} model {model}",
         comments=device_comments(device),
@@ -896,8 +900,35 @@ def netbox_interface_key(device_name, interface_name):
     return (str(device_name), str(interface_name))
 
 
-def netbox_interface_is_cabled(device_name, interface_name):
-    query = urllib.parse.urlencode({"device": device_name, "name": interface_name, "limit": 1})
+def netbox_device_lookup(device_name, serial=None):
+    lookups = []
+    if serial:
+        lookups.append(("serial", {"serial": serial, "limit": 1}))
+    if device_name:
+        lookups.append(("name", {"name": device_name, "limit": 1}))
+    for method, params in lookups:
+        query = urllib.parse.urlencode(params)
+        result = netbox_request("GET", f"/api/dcim/devices/?{query}")
+        if result and result.get("results"):
+            device = result["results"][0]
+            log_event(
+                "netbox_device_lookup_succeeded",
+                method=method,
+                requested_name=device_name,
+                serial=serial,
+                netbox_device_id=device.get("id"),
+                netbox_device_name=device.get("name"),
+            )
+            return device
+    log_event("netbox_device_lookup_missed", requested_name=device_name, serial=serial, attempted=[method for method, _ in lookups])
+    return None
+
+
+def netbox_interface_is_cabled(device_name, interface_name, serial=None):
+    device = netbox_device_lookup(device_name, serial)
+    if not device:
+        return False
+    query = urllib.parse.urlencode({"device_id": device.get("id"), "name": interface_name, "limit": 1})
     result = netbox_request("GET", f"/api/dcim/interfaces/?{query}")
     return bool(result and result.get("results") and result["results"][0].get("cable"))
 
@@ -908,6 +939,11 @@ def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device
         return set()
     started = time.monotonic()
     checked = {}
+    raw_device_by_mac = {
+        normalize_mac(device.get("mac") or device.get("macAddress")): device
+        for device in devices
+        if normalize_mac(device.get("mac") or device.get("macAddress"))
+    }
     for device in devices:
         local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
         uplink = device.get("uplink") or {}
@@ -925,7 +961,7 @@ def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device
             if key in checked:
                 continue
             try:
-                checked[key] = netbox_interface_is_cabled(*key)
+                checked[key] = netbox_interface_is_cabled(device_obj.name, iface.name, device_serial(raw_device_by_mac.get(mac, {})))
             except Exception as exc:
                 checked[key] = False
                 log_exception("cable_precheck_interface_failed", exc, device=device_obj.name, interface=iface.name)
