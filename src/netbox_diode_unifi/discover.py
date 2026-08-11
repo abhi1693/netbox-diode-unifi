@@ -679,7 +679,7 @@ def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx):
             remote_device = device_by_mac.get(remote_mac)
             label = f"UniFi LLDP {local_device.name if local_device else local_mac} {local_iface.name} to {remote_device.name if remote_device else remote_mac} {remote_iface.name}"
             cable = Cable(
-                type="Copper - Twisted Pair (UTP/STP)" if interface_type_for(uplink).endswith("base-t") else "Copper - Twinax (DAC)",
+                type="cat6" if interface_type_for(uplink).endswith("base-t") else "dac-active",
                 a_terminations=[GenericObject(object_interface=local_iface)],
                 b_terminations=[GenericObject(object_interface=remote_iface)],
                 status="connected" if uplink.get("up", True) else "planned",
