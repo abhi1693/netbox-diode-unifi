@@ -38,13 +38,20 @@ APP_VERSION = "0.2.0"
 TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
-SENSITIVE_LOG_KEYS = ("token", "secret", "password", "api_key", "authorization")
+SENSITIVE_LOG_KEYS = {"token", "api_key", "authorization", "password", "client_secret"}
+
+
+def is_sensitive_log_key(key):
+    normalized = key.lower()
+    if normalized.endswith("_configured") or normalized.endswith("_name"):
+        return False
+    return normalized in SENSITIVE_LOG_KEYS or normalized.endswith(("_token", "_api_key", "_password", "_client_secret"))
 
 
 def log_event(event, level="info", **fields):
     safe_fields = {}
     for key, value in fields.items():
-        if any(marker in key.lower() for marker in SENSITIVE_LOG_KEYS):
+        if is_sensitive_log_key(key):
             safe_fields[key] = "<redacted>"
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:

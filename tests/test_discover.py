@@ -24,12 +24,21 @@ def test_helpers_normalize_values():
 
 
 def test_log_event_redacts_sensitive_fields(capsys):
-    log_event("test_event", token="secret-token", api_key="secret-api-key", safe="visible")
+    log_event(
+        "test_event",
+        token="secret-token",
+        api_key="secret-api-key",
+        netbox_token_configured=True,
+        secret_name="safe-secret-name",
+        safe="visible",
+    )
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["event"] == "test_event"
     assert payload["token"] == "<redacted>"
     assert payload["api_key"] == "<redacted>"
+    assert payload["netbox_token_configured"] is True
+    assert payload["secret_name"] == "safe-secret-name"
     assert payload["safe"] == "visible"
 
 
