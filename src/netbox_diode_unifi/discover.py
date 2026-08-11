@@ -38,7 +38,7 @@ from netboxlabs.diode.sdk.ingester import (
 
 
 APP_NAME = "home-lab-unifi-discovery"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
@@ -532,8 +532,8 @@ def network_api_get(api_key, path):
     return data
 
 
-def network_api_get_optional(api_key, path):
-    payload = unifi_get_optional(api_key, path)
+def network_api_get_optional(api_key, path, params=None):
+    payload = unifi_get_optional(api_key, path, params)
     if not payload:
         return []
     meta = payload.get("meta", {})
@@ -1124,20 +1124,86 @@ def configured_vpn_endpoint_paths(site_slug):
     return [template.format(site=site_slug) for template in templates]
 
 
-def collect_vpn_configs(api_key, site_slug):
+def is_vpn_config(config):
+    purpose = str(config.get("purpose") or "").lower()
+    vpn_type = str(first_present(config, ["vpn_type", "type", "protocol", "connection_type"]) or "").lower()
+    return "vpn" in purpose or "vpn" in vpn_type or vpn_type in {"openvpn", "wireguard", "l2tp", "ipsec"}
+
+
+def vpn_config_identity(config):
+    name = vpn_config_name(config).casefold()
+    return name, vpn_encapsulation(config) or "unknown"
+
+
+def collect_official_vpn_configs(api_key, site_slug):
+    sites_path = "/integration/v1/sites"
+    sites = network_api_get_optional(api_key, sites_path, {"offset": 0, "limit": 200})
+    matching_sites = [site for site in sites if site.get("internalReference") == site_slug or site.get("id") == site_slug]
+    if not matching_sites and len(sites) == 1:
+        matching_sites = sites
+    if not matching_sites:
+        log_event("unifi_vpn_site_not_found", level="warning", site=site_slug, site_count=len(sites))
+        return []
+
+    site_id = matching_sites[0].get("id")
+    if not site_id:
+        log_event("unifi_vpn_site_not_found", level="warning", site=site_slug, reason="missing_site_id")
+        return []
+
     configs = []
-    seen = set()
+    paths = [
+        f"/integration/v1/sites/{site_id}/vpn/servers",
+        f"/integration/v1/sites/{site_id}/vpn/site-to-site-tunnels",
+    ]
+    for path in paths:
+        for config in network_api_get_optional(api_key, path, {"offset": 0, "limit": 200}):
+            if isinstance(config, dict):
+                configs.append(config | {"_unifi_endpoint": path, "_unifi_site_id": site_id})
+    log_event("unifi_official_vpn_configs_loaded", site=site_slug, endpoint_count=len(paths), item_count=len(configs))
+    return configs
+
+
+def collect_vpn_configs(api_key, site_slug, networks=None):
+    configs_by_identity = {}
+    source_counts = {"networkconf": 0, "official": 0, "optional": 0}
+
+    def add_config(config, path, source):
+        if not isinstance(config, dict):
+            return
+        enriched = config | {"_unifi_endpoint": config.get("_unifi_endpoint") or path}
+        identity = vpn_config_identity(enriched)
+        existing = configs_by_identity.get(identity, {})
+        merged = existing.copy()
+        for key, value in enriched.items():
+            if key not in merged or merged[key] in (None, "", []):
+                merged[key] = value
+        endpoints = list(existing.get("_unifi_endpoints") or [])
+        for endpoint in [existing.get("_unifi_endpoint"), enriched.get("_unifi_endpoint")]:
+            if endpoint and endpoint not in endpoints:
+                endpoints.append(endpoint)
+        merged["_unifi_endpoints"] = endpoints
+        configs_by_identity[identity] = merged
+        source_counts[source] += 1
+
+    networkconf_path = f"/api/s/{site_slug}/rest/networkconf"
+    for config in networks or []:
+        if is_vpn_config(config):
+            add_config(config, networkconf_path, "networkconf")
+
+    for config in collect_official_vpn_configs(api_key, site_slug):
+        add_config(config, config.get("_unifi_endpoint"), "official")
+
     paths = configured_vpn_endpoint_paths(site_slug)
     for path in paths:
         for config in network_api_get_optional(api_key, path):
-            if not isinstance(config, dict):
-                continue
-            key = config.get("_id") or config.get("id") or config.get("external_id") or compact_json(config)
-            if key in seen:
-                continue
-            seen.add(key)
-            configs.append(config | {"_unifi_endpoint": path})
-    log_event("vpn_configs_loaded", endpoint_count=len(paths), item_count=len(configs))
+            add_config(config, path, "optional")
+    configs = list(configs_by_identity.values())
+    log_event(
+        "vpn_configs_loaded",
+        endpoint_count=len(paths) + 3,
+        item_count=len(configs),
+        source_counts=source_counts,
+    )
     return configs
 
 
@@ -1163,8 +1229,10 @@ def vpn_encapsulation(config):
         return "wireguard"
     if "openvpn" in raw:
         return "openvpn"
+    if "l2tp" in raw:
+        return "l2tp"
     if "ipsec" in raw or "site-to-site" in raw or "s2s" in raw:
-        return "ipsec"
+        return "ipsec-tunnel"
     if "gre" in raw:
         return "gre"
     return raw or None
@@ -1234,6 +1302,8 @@ def vpn_config_comments(config):
         "id",
         "external_id",
         "_unifi_endpoint",
+        "_unifi_endpoints",
+        "_unifi_site_id",
         "name",
         "type",
         "protocol",
@@ -1253,6 +1323,17 @@ def vpn_config_comments(config):
         "wan_networkgroup",
         "networkgroup",
         "site_id",
+        "purpose",
+        "ip_subnet",
+        "ipv6_subnet",
+        "local_port",
+        "openvpn_interface",
+        "openvpn_local_wan_ip",
+        "wireguard_interface",
+        "wireguard_local_wan_ip",
+        "dhcpd_start",
+        "dhcpd_stop",
+        "metadata",
     ]
     return f"UniFi VPN details: {compact_json(filtered_metadata(config, safe_keys))}"
 
@@ -1795,7 +1876,7 @@ def collect_entities(api_key):
     clients = network_api_get(api_key, f"/api/s/{site_slug}/stat/sta")
     networks = network_api_get(api_key, f"/api/s/{site_slug}/rest/networkconf")
     wlans = network_api_get(api_key, f"/api/s/{site_slug}/rest/wlanconf")
-    vpn_configs = collect_vpn_configs(api_key, site_slug)
+    vpn_configs = collect_vpn_configs(api_key, site_slug, networks)
     device_type_import = ensure_device_types(devices)
     entities = build_device_entities(devices, networks, clients, wlans, vpn_configs)
     counts = {

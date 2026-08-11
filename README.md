@@ -2,9 +2,9 @@
 
 UniFi Network API inventory collector for NetBox Diode.
 
-The collector reads UniFi inventory from the UniFi Network API under
-`/proxy/network/api/s/<site>` and sends NetBox entities to Diode for
-reconciliation into NetBox.
+The collector reads UniFi inventory from the UniFi Network APIs under
+`/proxy/network/api/s/<site>` and `/proxy/network/integration/v1`, then sends
+NetBox entities to Diode for reconciliation into NetBox.
 
 ## Runtime
 
@@ -50,11 +50,14 @@ accurate enough to avoid duplicate endpoint devices.
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.
 
-VPN data is modeled only when UniFi exposes explicit VPN configuration records.
-Discovered VPN records create a `UniFi VPN` tunnel group, tunnel objects, and
-remote network prefixes when remote CIDRs are present. If UniFi does not expose
-VPN collections, the collector logs the skipped optional endpoints and emits no
-VPN objects.
+VPN data is collected from the official VPN server and site-to-site endpoints
+and enriched with detailed VPN network configuration records from
+`networkconf`. Discovered OpenVPN, L2TP, WireGuard, and IPsec records create a
+`UniFi VPN` tunnel group and tunnel objects. VPN pool networks and DHCP ranges
+are emitted through the normal prefix and IP-range discovery, while explicit
+site-to-site remote CIDRs are emitted as VPN prefixes. If UniFi exposes no VPN
+records, the collector logs the skipped optional endpoints and emits no VPN
+objects.
 
 WAN circuit cabling is modeled only when UniFi exposes a matching local gateway
 WAN port. The collector cables the discovered circuit termination to that

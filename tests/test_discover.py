@@ -3,6 +3,7 @@ from netbox_diode_unifi.discover import (
     build_device_entities,
     build_ip_range_entities,
     build_vpn_entities,
+    collect_vpn_configs,
     ensure_device_types,
     ip_with_mask,
     log_event,
@@ -497,8 +498,83 @@ def test_build_vpn_entities_adds_tunnel_and_remote_prefixes():
     assert fields == ["tunnel_group", "tunnel", "prefix", "prefix"]
     assert entities[0].tunnel_group.name == "UniFi VPN"
     assert entities[1].tunnel.name == "Office S2S"
-    assert entities[1].tunnel.encapsulation == "ipsec"
+    assert entities[1].tunnel.encapsulation == "ipsec-tunnel"
     assert [entity.prefix.prefix for entity in entities[2:]] == ["10.50.0.0/24", "10.60.0.0/24"]
+
+
+def test_collect_vpn_configs_merges_detailed_networks_with_official_servers(monkeypatch):
+    site_id = "88f7af54-98f8-306a-a1c7-c9349722b1f6"
+
+    def fake_optional(_api_key, path, params=None):
+        if path == "/integration/v1/sites":
+            return [{"id": site_id, "internalReference": "default", "name": "Default"}]
+        if path == f"/integration/v1/sites/{site_id}/vpn/servers":
+            return [
+                {"id": "official-openvpn", "name": "OpenVPN Server", "type": "OPENVPN", "enabled": True},
+                {"id": "official-l2tp", "name": "L2TP Server", "type": "L2TP", "enabled": True},
+                {"id": "official-wireguard", "name": "WireGuard Server 1", "type": "WIREGUARD", "enabled": True},
+            ]
+        return []
+
+    monkeypatch.setattr("netbox_diode_unifi.discover.network_api_get_optional", fake_optional)
+    configs = collect_vpn_configs(
+        "api-key",
+        "default",
+        [
+            {
+                "_id": "legacy-openvpn",
+                "name": "OpenVPN Server",
+                "purpose": "remote-user-vpn",
+                "vpn_type": "openvpn-server",
+                "enabled": True,
+                "ip_subnet": "192.168.5.1/24",
+                "local_port": 1194,
+                "openvpn_interface": "wan2",
+            },
+            {
+                "_id": "legacy-l2tp",
+                "name": "L2TP Server",
+                "purpose": "remote-user-vpn",
+                "vpn_type": "l2tp-server",
+                "enabled": True,
+                "ip_subnet": "192.168.6.1/24",
+            },
+            {
+                "_id": "legacy-wireguard",
+                "name": "WireGuard Server 1",
+                "purpose": "remote-user-vpn",
+                "vpn_type": "wireguard-server",
+                "enabled": True,
+                "ip_subnet": "192.168.7.1/24",
+                "local_port": 51820,
+                "wireguard_interface": "wan",
+            },
+        ],
+    )
+
+    assert len(configs) == 3
+    assert {config["name"] for config in configs} == {"OpenVPN Server", "L2TP Server", "WireGuard Server 1"}
+    openvpn = next(config for config in configs if config["name"] == "OpenVPN Server")
+    assert openvpn["ip_subnet"] == "192.168.5.1/24"
+    assert openvpn["id"] == "official-openvpn"
+    assert len(openvpn["_unifi_endpoints"]) == 2
+
+
+def test_build_vpn_entities_normalizes_unifi_server_types():
+    entities = build_vpn_entities(
+        [
+            {"name": "OpenVPN Server", "vpn_type": "openvpn-server", "enabled": True},
+            {"name": "L2TP Server", "vpn_type": "l2tp-server", "enabled": True},
+            {"name": "WireGuard Server 1", "vpn_type": "wireguard-server", "enabled": True},
+        ]
+    )
+
+    tunnels = [entity.tunnel for entity in entities if entity.HasField("tunnel")]
+    assert [(tunnel.name, tunnel.encapsulation) for tunnel in tunnels] == [
+        ("OpenVPN Server", "openvpn"),
+        ("L2TP Server", "l2tp"),
+        ("WireGuard Server 1", "wireguard"),
+    ]
 
 
 def test_build_vpn_entities_skips_when_unifi_has_no_vpn_configs(capsys):
