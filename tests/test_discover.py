@@ -10,6 +10,7 @@ from netbox_diode_unifi.discover import (
     netbox_auth_header,
     normalize_mac,
     slugify,
+    unifi_device_type_library_name,
     unifi_device_type_model,
 )
 import json
@@ -27,6 +28,9 @@ def test_helpers_normalize_values():
     assert unifi_device_type_model({"model": "UDMPRO"}) == "UniFi Dream Machine Pro"
     assert unifi_device_type_model({"model": "USAGGPRO"}) == "UniFi Switch Pro Aggregation"
     assert unifi_device_type_model({"model": "UNKNOWNMODEL"}) == "UNKNOWNMODEL"
+    assert unifi_device_type_library_name({"model": "UDMPRO"}) == "UniFi-Dream-Machine-Pro.yaml"
+    assert unifi_device_type_library_name({"model": "USAGGPRO"}) == "USW-Pro-Aggregation.yaml"
+    assert unifi_device_type_library_name({"model": "UNKNOWNMODEL"}) == "UNKNOWNMODEL"
 
 
 def test_log_event_redacts_sensitive_fields(capsys):
@@ -82,8 +86,22 @@ def test_ensure_device_types_imports_mapped_unifi_device_type_name(monkeypatch):
     def fake_netbox_request(method, path, payload=None, token=None):
         calls.append((method, path, payload, token))
         if method == "GET":
+            if path.startswith("/api/plugins/meta-types/device-types/"):
+                return {
+                    "count": 1,
+                    "results": [
+                        {
+                            "name": "USW-Pro-Aggregation.yaml",
+                            "vendor": "Ubiquiti",
+                            "type": "device-types",
+                            "sha": "abc123",
+                            "download_url": None,
+                            "is_new": True,
+                        }
+                    ],
+                }
             return {"count": 0, "results": []}
-        return {"message": "Imported: UniFi Switch Pro Aggregation"}
+        return {"message": "Imported: USW-Pro-Aggregation.yaml"}
 
     monkeypatch.setenv("NETBOX_TOKEN", "nbt_example.secret")
     monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
@@ -97,9 +115,22 @@ def test_ensure_device_types_imports_mapped_unifi_device_type_name(monkeypatch):
     assert calls == [
         ("GET", "/api/dcim/device-types/?model=UniFi+Switch+Pro+Aggregation&limit=1", None, "nbt_example.secret"),
         (
+            "GET",
+            "/api/plugins/meta-types/device-types/?name=USW-Pro-Aggregation.yaml&vendor=Ubiquiti&type=device-types&limit=1",
+            None,
+            "nbt_example.secret",
+        ),
+        (
             "POST",
             "/api/plugins/meta-types/device-type-import/",
-            {"name": "UniFi Switch Pro Aggregation"},
+            {
+                "name": "USW-Pro-Aggregation.yaml",
+                "vendor": "Ubiquiti",
+                "type": "device-types",
+                "sha": "abc123",
+                "download_url": None,
+                "is_new": True,
+            },
             "nbt_example.secret",
         ),
     ]

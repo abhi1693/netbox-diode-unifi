@@ -46,6 +46,13 @@ UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME = {
     "USAGGPRO": "UniFi Switch Pro Aggregation",
     "USL24PB": "UniFi Switch 24 PoE",
 }
+UNIFI_DEVICE_TYPE_LIBRARY_NAME_BY_SHORTNAME = {
+    "U6ENT": "U6-Enterprise.yaml",
+    "UAPL6": "U6+.yaml",
+    "UDMPRO": "UniFi-Dream-Machine-Pro.yaml",
+    "USAGGPRO": "USW-Pro-Aggregation.yaml",
+    "USL24PB": "USW-24-PoE.yaml",
+}
 
 
 def is_sensitive_log_key(key):
@@ -114,6 +121,11 @@ def clean_name(*values):
 def unifi_device_type_model(device):
     raw_model = clean_name(device.get("model"), "UniFi Device")
     return UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME.get(raw_model.upper(), raw_model)
+
+
+def unifi_device_type_library_name(device):
+    raw_model = clean_name(device.get("model"), "UniFi Device")
+    return UNIFI_DEVICE_TYPE_LIBRARY_NAME_BY_SHORTNAME.get(raw_model.upper(), raw_model)
 
 
 def normalize_mac(value):
@@ -326,13 +338,13 @@ def netbox_request(method, path, payload=None, token=None):
             )
             return json.loads(body) if body else {}
     except Exception as exc:
-        log_exception(
-            "netbox_request_failed",
-            exc,
-            method=method,
-            path=path,
-            elapsed_ms=round((time.monotonic() - started) * 1000),
-        )
+        fields = {"method": method, "path": path, "elapsed_ms": round((time.monotonic() - started) * 1000)}
+        if hasattr(exc, "read"):
+            try:
+                fields["response_body"] = exc.read().decode()[:1000]
+            except Exception:
+                pass
+        log_exception("netbox_request_failed", exc, **fields)
         raise
 
 
@@ -355,26 +367,52 @@ def ensure_device_types(devices):
             device_count=len(devices),
         )
         return {"checked": 0, "imported": 0, "missing": 0, "failed": 0}
-    models = sorted({unifi_device_type_model(device) for device in devices if device.get("model")})
-    result = {"checked": len(models), "imported": 0, "missing": 0, "failed": 0}
-    log_event("device_type_import_start", model_count=len(models), models=models)
-    for model in models:
+    device_type_specs = sorted(
+        {
+            (unifi_device_type_model(device), unifi_device_type_library_name(device))
+            for device in devices
+            if device.get("model")
+        }
+    )
+    result = {"checked": len(device_type_specs), "imported": 0, "missing": 0, "failed": 0}
+    log_event(
+        "device_type_import_start",
+        model_count=len(device_type_specs),
+        models=[model for model, _ in device_type_specs],
+        library_names=[library_name for _, library_name in device_type_specs],
+    )
+    for model, library_name in device_type_specs:
         query = urllib.parse.urlencode({"model": model, "limit": 1})
         try:
             existing = netbox_request("GET", f"/api/dcim/device-types/?{query}", token=token)
             if existing and existing.get("count", 0) > 0:
                 log_event("device_type_import_existing", model=model)
                 continue
-            response = netbox_request("POST", "/api/plugins/meta-types/device-type-import/", {"name": model}, token=token)
+            library_query = urllib.parse.urlencode({"name": library_name, "vendor": UBIQUITI.name, "type": "device-types", "limit": 1})
+            library = netbox_request("GET", f"/api/plugins/meta-types/device-types/?{library_query}", token=token)
+            record = (library.get("results") or [None])[0] if library else None
+            if not record:
+                result["missing"] += 1
+                log_event("device_type_import_missing", level="warning", model=model, library_name=library_name, response=library)
+                continue
+            payload = {
+                "name": record["name"],
+                "vendor": record["vendor"],
+                "type": record.get("type", "device-types"),
+                "sha": record["sha"],
+                "download_url": record.get("download_url"),
+                "is_new": record.get("is_new", False),
+            }
+            response = netbox_request("POST", "/api/plugins/meta-types/device-type-import/", payload, token=token)
             if response and "Imported:" in response.get("message", ""):
                 result["imported"] += 1
-                log_event("device_type_import_imported", model=model, message=response.get("message"))
+                log_event("device_type_import_imported", model=model, library_name=library_name, message=response.get("message"))
             else:
                 result["missing"] += 1
-                log_event("device_type_import_missing", level="warning", model=model, response=response)
+                log_event("device_type_import_missing", level="warning", model=model, library_name=library_name, response=response)
         except Exception as exc:
             result["failed"] += 1
-            log_exception("device_type_import_failed", exc, model=model)
+            log_exception("device_type_import_failed", exc, model=model, library_name=library_name)
     log_event(
         "device_type_import_finished",
         elapsed_ms=round((time.monotonic() - started) * 1000),
