@@ -38,7 +38,7 @@ from netboxlabs.diode.sdk.ingester import (
 
 
 APP_NAME = "home-lab-unifi-discovery"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
@@ -1530,8 +1530,8 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 default_network_prefixes=[str(prefix) for prefix in mgmt_prefixes],
                 selected_from_default_network=ip_selection_reason == "default_network",
             )
-        if ip_address:
-            seen_ips.add(ip_address)
+        mgmt = None
+        if ip_address or device_mac:
             mgmt = Interface(
                 device=device_obj,
                 name="mgmt",
@@ -1543,6 +1543,10 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 tags=TAGS,
                 metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
             )
+            entities.append(Entity(interface=mgmt))
+
+        if ip_address:
+            seen_ips.add(ip_address)
             mgmt_ip = IPAddress(
                 address=ip_address,
                 status="active",
@@ -1560,15 +1564,15 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 device_obj.primary_ip4.CopyFrom(mgmt_ip)
             else:
                 device_obj.primary_ip6.CopyFrom(mgmt_ip)
-            entities.append(Entity(interface=mgmt))
             entities.append(Entity(ip_address=mgmt_ip))
 
         if device_mac:
             mac_obj = MACAddress(
                 mac_address=device_mac,
+                assigned_object_interface=mgmt,
                 description=f"UniFi device MAC for {device_obj.name}",
                 tags=TAGS,
-                metadata={"source": APP_NAME},
+                metadata={"source": APP_NAME, "device_serial": device_serial(device)},
             )
             if device_mac not in seen_macs:
                 seen_macs.add(device_mac)
@@ -1729,6 +1733,9 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
     entities = []
     seen_macs = seen_macs if seen_macs is not None else set()
     include_devices = bool_env("UNIFI_INCLUDE_CLIENT_DEVICES", False)
+    if not include_devices:
+        log_event("client_entities_skipped", reason="client_device_modeling_disabled", client_count=len(clients))
+        return entities
     for client in clients:
         mac = normalize_mac(client.get("mac") or client.get("macAddress"))
         ip_address = ip_with_mask(client.get("ip") or client.get("ipAddress"))
@@ -1740,37 +1747,6 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
             client,
             ["_id", "user_id", "mac", "network_id", "site_id", "network", "vlan", "is_wired", "sw_mac", "sw_port", "last_uplink_mac", "last_uplink_remote_port", "ap_mac", "essid"],
         ) | {"source": APP_NAME, "attached_to_parent_interface": bool(parent)}
-        if not include_devices:
-            if mac:
-                if mac not in seen_macs:
-                    seen_macs.add(mac)
-                    entities.append(
-                        Entity(
-                            mac_address=MACAddress(
-                                mac_address=mac,
-                                description=f"UniFi observed client MAC for {client_name}",
-                                tags=TAGS,
-                                metadata=client_metadata,
-                            )
-                        )
-                    )
-                else:
-                    log_event("mac_address_skipped", reason="duplicate", mac=mac, owner=client_name, owner_type="client")
-            if ip_address and ip_address not in seen_ips:
-                seen_ips.add(ip_address)
-                entities.append(
-                    Entity(
-                        ip_address=IPAddress(
-                            address=ip_address,
-                            status="active",
-                            description=f"UniFi observed client IP for {client_name}",
-                            comments=compact_json(client_metadata),
-                            tags=TAGS,
-                            metadata={"source": APP_NAME, "client_mac": mac},
-                        )
-                    )
-                )
-            continue
         client_device = Device(
             name=client_name,
             device_type=DeviceType(manufacturer=UNKNOWN, model="UniFi Client", slug="unifi-client"),

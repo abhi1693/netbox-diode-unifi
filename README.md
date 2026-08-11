@@ -42,10 +42,13 @@ Optional environment variables:
 When `UNIFI_API_KEY` is not set, the collector reads the API key from the
 configured Kubernetes Secret using its pod ServiceAccount token.
 
-Client devices are not modeled by default. Client MAC/IP observations are
-included as standalone records with UniFi attachment metadata; set
+Client devices are not modeled by default, and no standalone client MAC/IP
+records are emitted while client modeling is disabled. Set
 `UNIFI_INCLUDE_CLIENT_DEVICES=true` only after infrastructure devices are
-accurate enough to avoid duplicate endpoint devices.
+accurate enough to model client interfaces and their assigned addresses.
+
+Infrastructure device MAC addresses are assigned to each device's virtual
+`mgmt` interface so repeated Diode runs reconcile the same NetBox object.
 
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.

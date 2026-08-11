@@ -331,6 +331,10 @@ def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
     assert ip_entity.ip_address.assigned_object_interface.name == "mgmt"
     assert ip_entity.ip_address.assigned_object_interface.device.name == "AP Test"
     assert ip_entity.ip_address.assigned_object_interface.parent.name == "eth0"
+    mac_entity = next(entity for entity in entities if "mac_address" in entity_fields(entity))
+    assert mac_entity.mac_address.assigned_object_interface.name == "mgmt"
+    assert mac_entity.mac_address.assigned_object_interface.device.name == "AP Test"
+    assert mac_entity.mac_address.assigned_object_interface.parent.name == "eth0"
 
 
 def test_build_device_entities_uses_mapped_device_type_model():
@@ -704,7 +708,7 @@ def test_build_device_entities_falls_back_to_first_valid_ip_without_default_netw
     assert selection_log["reason"] == "first_valid"
 
 
-def test_build_device_entities_skips_duplicate_client_mac_addresses(capsys):
+def test_build_device_entities_skips_all_clients_when_modeling_is_disabled(capsys):
     entities = build_device_entities(
         devices=[],
         clients=[
@@ -723,14 +727,13 @@ def test_build_device_entities_skips_duplicate_client_mac_addresses(capsys):
         wlans=[],
     )
 
-    mac_entities = [entity for entity in entities if "mac_address" in entity_fields(entity)]
-    assert [entity.mac_address.mac_address for entity in mac_entities] == ["aa:bb:cc:dd:ee:ff"]
+    assert [entity for entity in entities if "mac_address" in entity_fields(entity)] == []
+    assert [entity for entity in entities if "ip_address" in entity_fields(entity)] == []
 
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    duplicate_log = next(log for log in logs if log["event"] == "mac_address_skipped")
-    assert duplicate_log["reason"] == "duplicate"
-    assert duplicate_log["mac"] == "aa:bb:cc:dd:ee:ff"
-    assert duplicate_log["owner_type"] == "client"
+    skipped_log = next(log for log in logs if log["event"] == "client_entities_skipped")
+    assert skipped_log["reason"] == "client_device_modeling_disabled"
+    assert skipped_log["client_count"] == 2
 
 
 def test_build_device_entities_prefers_device_mac_over_duplicate_client_mac(capsys):
@@ -759,7 +762,9 @@ def test_build_device_entities_prefers_device_mac_over_duplicate_client_mac(caps
     mac_entities = [entity for entity in entities if "mac_address" in entity_fields(entity)]
     assert len(mac_entities) == 1
     assert mac_entities[0].mac_address.description == "UniFi device MAC for Switch Test"
+    assert mac_entities[0].mac_address.assigned_object_interface.name == "mgmt"
+    assert mac_entities[0].mac_address.assigned_object_interface.device.name == "Switch Test"
 
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    duplicate_log = next(log for log in logs if log["event"] == "mac_address_skipped")
-    assert duplicate_log["owner_type"] == "client"
+    skipped_log = next(log for log in logs if log["event"] == "client_entities_skipped")
+    assert skipped_log["client_count"] == 1
