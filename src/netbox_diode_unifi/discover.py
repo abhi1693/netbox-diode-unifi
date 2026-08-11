@@ -313,8 +313,6 @@ def build_wireless_lan_entities(wlans, vlan_by_id, home_site):
                     status="active" if wlan.get("enabled", True) else "disabled",
                     vlan=vlan_by_id.get(wlan.get("networkconf_id")),
                     scope_site=home_site,
-                    auth_type=wlan.get("security"),
-                    auth_cipher=wlan.get("wpa_enc"),
                     description=f"UniFi WLAN {ssid}",
                     comments=compact_json(
                         filtered_metadata(
@@ -369,7 +367,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 type=interface_type_for(port),
                 enabled=bool(port.get("enable", port.get("enabled", True))),
                 speed=speed_kbps(port.get("speed") or port.get("max_speed")),
-                description=f"UniFi port {port.get('port_idx')}: {port_comments(port)}",
+                description=f"UniFi port {port.get('port_idx')} {port.get('media') or ''} speed={port.get('speed') or 'unknown'} up={port.get('up')}",
                 mode="access" if native_vlan else None,
                 untagged_vlan=native_vlan,
                 mark_connected=bool(port.get("up") or port.get("last_connection", {}).get("connected")),
@@ -404,10 +402,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 type=interface_type_for(uplink),
                 enabled=bool(uplink.get("up", True)),
                 speed=speed_kbps(uplink.get("speed") or uplink.get("max_speed")),
-                description=(
-                    "UniFi discovered uplink interface "
-                    f"{compact_json(filtered_metadata(uplink, ['uplink_mac', 'uplink_device_name', 'uplink_remote_port', 'media', 'type']))}"
-                ),
+                description="UniFi discovered uplink interface",
                 mark_connected=True,
                 tags=TAGS,
                 metadata=filtered_metadata(uplink, ["port_idx", "uplink_mac", "uplink_device_name", "uplink_remote_port"]) | {"source": APP_NAME},
@@ -424,10 +419,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 enabled=True,
                 parent=parent,
                 mgmt_only=True,
-                description=(
-                    f"Parent interface: {parent.name if parent else 'unknown'}; "
-                    f"uplink={compact_json(filtered_metadata(uplink, ['uplink_mac', 'uplink_device_name', 'uplink_remote_port', 'port_idx']))}"
-                ),
+                description=f"UniFi management interface; parent={parent.name if parent else 'unknown'}",
                 tags=TAGS,
                 metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
             )
@@ -506,7 +498,7 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
             enabled=True,
             parent=parent,
             speed=speed_kbps(client.get("wired_rate_mbps")),
-            description=f"UniFi observed client attachment: {compact_json(filtered_metadata(client, ['sw_mac', 'sw_port', 'last_uplink_mac', 'last_uplink_name', 'last_uplink_remote_port', 'ap_mac', 'essid', 'radio']))}",
+            description="UniFi observed client attachment",
             mark_connected=True,
             tags=TAGS,
             metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
