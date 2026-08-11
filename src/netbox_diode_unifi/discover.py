@@ -1,9 +1,11 @@
 import base64
+import datetime
 import ipaddress
 import json
 import os
 import re
 import ssl
+import time
 import urllib.parse
 import urllib.request
 
@@ -36,6 +38,42 @@ APP_VERSION = "0.2.0"
 TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
+SENSITIVE_LOG_KEYS = ("token", "secret", "password", "api_key", "authorization")
+
+
+def log_event(event, level="info", **fields):
+    safe_fields = {}
+    for key, value in fields.items():
+        if any(marker in key.lower() for marker in SENSITIVE_LOG_KEYS):
+            safe_fields[key] = "<redacted>"
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            safe_fields[key] = value
+        else:
+            safe_fields[key] = json.loads(compact_json(value))
+    payload = {
+        "ts": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "level": level,
+        "event": event,
+        **safe_fields,
+    }
+    print(compact_json(payload), flush=True)
+
+
+def log_exception(event, exc, **fields):
+    log_event(event, level="error", error_type=exc.__class__.__name__, error=str(exc), **fields)
+
+
+def entity_type_counts(entities):
+    counts = {}
+    for entity in entities:
+        fields = entity.ListFields()
+        if not fields:
+            counts["empty"] = counts.get("empty", 0) + 1
+            continue
+        name = fields[-1][0].name
+        counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def site():
@@ -92,6 +130,8 @@ def bool_env(name, default=False):
 
 
 def read_kubernetes_secret_key(namespace, name, key):
+    started = time.monotonic()
+    log_event("kubernetes_secret_read_start", namespace=namespace, secret_name=name, key=key)
     token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
     with open(token_path, "r", encoding="utf-8") as handle:
@@ -101,15 +141,34 @@ def read_kubernetes_secret_key(namespace, name, key):
     url = f"https://{host}:{port}/api/v1/namespaces/{namespace}/secrets/{name}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     ctx = ssl.create_default_context(cafile=ca_path)
-    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-        secret = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+            secret = json.loads(resp.read())
+    except Exception as exc:
+        log_exception(
+            "kubernetes_secret_read_failed",
+            exc,
+            namespace=namespace,
+            secret_name=name,
+            key=key,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise
     encoded = secret.get("data", {}).get(key)
     if not encoded:
         raise RuntimeError(f"secret key {namespace}/{name}:{key} is empty or missing")
+    log_event(
+        "kubernetes_secret_read_succeeded",
+        namespace=namespace,
+        secret_name=name,
+        key=key,
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
     return base64.b64decode(encoded).decode().strip()
 
 
 def unifi_get(api_key, path, params=None):
+    started = time.monotonic()
     host = os.environ["UNIFI_HOST"].rstrip("/")
     base_path = os.getenv("UNIFI_API_BASE_PATH", "/proxy/network").rstrip("/")
     verify_tls = os.getenv("UNIFI_VERIFY_TLS", "false").lower() == "true"
@@ -118,11 +177,33 @@ def unifi_get(api_key, path, params=None):
     headers = {"X-API-Key": api_key, "Accept": "application/json"}
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
-    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-        return json.loads(resp.read())
+    log_event("unifi_request_start", method="GET", path=path, params=params or {}, verify_tls=verify_tls)
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            body = resp.read()
+            log_event(
+                "unifi_request_succeeded",
+                method="GET",
+                path=path,
+                status=resp.status,
+                bytes=len(body),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
+            return json.loads(body)
+    except Exception as exc:
+        log_exception(
+            "unifi_request_failed",
+            exc,
+            method="GET",
+            path=path,
+            params=params or {},
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise
 
 
 def netbox_request(method, path, payload=None, token=None):
+    started = time.monotonic()
     base_url = os.getenv("NETBOX_URL", "http://netbox.netbox.svc.cluster.local").rstrip("/")
     token = token or os.getenv("NETBOX_TOKEN")
     if not token:
@@ -132,9 +213,28 @@ def netbox_request(method, path, payload=None, token=None):
     if payload is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"{base_url}{path}", data=data, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read()
-        return json.loads(body) if body else {}
+    log_event("netbox_request_start", method=method, path=path, has_payload=payload is not None)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            log_event(
+                "netbox_request_succeeded",
+                method=method,
+                path=path,
+                status=resp.status,
+                bytes=len(body),
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
+            return json.loads(body) if body else {}
+    except Exception as exc:
+        log_exception(
+            "netbox_request_failed",
+            exc,
+            method=method,
+            path=path,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise
 
 
 def netbox_auth_header(token):
@@ -147,26 +247,40 @@ def netbox_auth_header(token):
 
 
 def ensure_device_types(devices):
+    started = time.monotonic()
     token = os.getenv("NETBOX_TOKEN")
     if not token or not bool_env("UNIFI_IMPORT_DEVICE_TYPES", True):
+        log_event(
+            "device_type_import_skipped",
+            reason="missing_token" if not token else "disabled",
+            device_count=len(devices),
+        )
         return {"checked": 0, "imported": 0, "missing": 0, "failed": 0}
     models = sorted({clean_name(device.get("model")) for device in devices if device.get("model")})
     result = {"checked": len(models), "imported": 0, "missing": 0, "failed": 0}
+    log_event("device_type_import_start", model_count=len(models), models=models)
     for model in models:
         query = urllib.parse.urlencode({"manufacturer": UBIQUITI.slug, "model": model, "limit": 1})
         try:
             existing = netbox_request("GET", f"/api/dcim/device-types/?{query}", token=token)
             if existing and existing.get("count", 0) > 0:
+                log_event("device_type_import_existing", model=model)
                 continue
             response = netbox_request("POST", "/api/plugins/meta-types/device-type-import/", {"name": model}, token=token)
             if response and "Imported:" in response.get("message", ""):
                 result["imported"] += 1
+                log_event("device_type_import_imported", model=model, message=response.get("message"))
             else:
                 result["missing"] += 1
-                print(f"device type importer did not import model={model!r} response={response!r}")
+                log_event("device_type_import_missing", level="warning", model=model, response=response)
         except Exception as exc:
             result["failed"] += 1
-            print(f"device type importer failed model={model!r} error={exc}")
+            log_exception("device_type_import_failed", exc, model=model)
+    log_event(
+        "device_type_import_finished",
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+        **result,
+    )
     return result
 
 
@@ -189,8 +303,11 @@ def network_api_get(api_key, path):
     payload = unifi_get(api_key, path)
     meta = payload.get("meta", {})
     if meta.get("rc") not in (None, "ok"):
+        log_event("unifi_api_error_response", level="error", path=path, meta=meta)
         raise RuntimeError(f"UniFi Network API error for {path}: {meta}")
-    return payload.get("data") or []
+    data = payload.get("data") or []
+    log_event("unifi_api_data_loaded", path=path, item_count=len(data))
+    return data
 
 
 def role_for_device(device):
@@ -678,7 +795,9 @@ def netbox_interface_is_cabled(device_name, interface_name):
 
 def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx):
     if not os.getenv("NETBOX_TOKEN"):
+        log_event("cable_precheck_skipped", reason="missing_netbox_token")
         return set()
+    started = time.monotonic()
     checked = {}
     for device in devices:
         local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
@@ -700,8 +819,15 @@ def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device
                 checked[key] = netbox_interface_is_cabled(*key)
             except Exception as exc:
                 checked[key] = False
-                print(f"NetBox interface cable precheck failed device={device_obj.name!r} interface={iface.name!r} error={exc}")
-    return {key for key, is_cabled in checked.items() if is_cabled}
+                log_exception("cable_precheck_interface_failed", exc, device=device_obj.name, interface=iface.name)
+    cabled = {key for key, is_cabled in checked.items() if is_cabled}
+    log_event(
+        "cable_precheck_finished",
+        checked=len(checked),
+        already_cabled=len(cabled),
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
+    return cabled
 
 
 def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces=None):
@@ -730,10 +856,24 @@ def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, exi
             local_key = netbox_interface_key(local_device.name if local_device else local_mac, local_iface.name)
             remote_key = netbox_interface_key(remote_device.name if remote_device else remote_mac, remote_iface.name)
             if local_key in existing_cabled_interfaces or remote_key in existing_cabled_interfaces:
-                print(f"skipping existing cabled link local={local_key!r} remote={remote_key!r}")
+                log_event(
+                    "cable_skipped",
+                    reason="endpoint_already_cabled",
+                    local_device=local_key[0],
+                    local_interface=local_key[1],
+                    remote_device=remote_key[0],
+                    remote_interface=remote_key[1],
+                )
                 continue
             if local_key in seen_interfaces or remote_key in seen_interfaces:
-                print(f"skipping duplicate discovered cabled link local={local_key!r} remote={remote_key!r}")
+                log_event(
+                    "cable_skipped",
+                    reason="duplicate_discovered_endpoint",
+                    local_device=local_key[0],
+                    local_interface=local_key[1],
+                    remote_device=remote_key[0],
+                    remote_interface=remote_key[1],
+                )
                 continue
             seen_interfaces.update([local_key, remote_key])
             label = f"UniFi LLDP {local_device.name if local_device else local_mac} {local_iface.name} to {remote_device.name if remote_device else remote_mac} {remote_iface.name}"
@@ -870,7 +1010,15 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
 
 def read_unifi_api_key():
     if os.getenv("UNIFI_API_KEY"):
+        log_event("unifi_api_key_source", source="environment")
         return os.environ["UNIFI_API_KEY"].strip()
+    log_event(
+        "unifi_api_key_source",
+        source="kubernetes_secret",
+        namespace=os.getenv("UNIFI_SECRET_NAMESPACE", "kube-public"),
+        secret_name=os.getenv("UNIFI_SECRET_NAME", "external-dns-unifi-sops"),
+        key=os.getenv("UNIFI_SECRET_KEY", "api-key"),
+    )
     return read_kubernetes_secret_key(
         os.getenv("UNIFI_SECRET_NAMESPACE", "kube-public"),
         os.getenv("UNIFI_SECRET_NAME", "external-dns-unifi-sops"),
@@ -879,45 +1027,89 @@ def read_unifi_api_key():
 
 
 def collect_entities(api_key):
+    started = time.monotonic()
     site_slug = os.getenv("UNIFI_NETWORK_SITE", "default")
+    log_event("collection_start", site=site_slug)
     devices = network_api_get(api_key, f"/api/s/{site_slug}/stat/device")
     clients = network_api_get(api_key, f"/api/s/{site_slug}/stat/sta")
     networks = network_api_get(api_key, f"/api/s/{site_slug}/rest/networkconf")
     wlans = network_api_get(api_key, f"/api/s/{site_slug}/rest/wlanconf")
     device_type_import = ensure_device_types(devices)
     entities = build_device_entities(devices, networks, clients, wlans)
-    return entities, {
+    counts = {
         "devices": len(devices),
         "clients": len(clients),
         "networks": len(networks),
         "wlans": len(wlans),
         "entities": len(entities),
+        "entity_types": entity_type_counts(entities),
         "device_type_import": device_type_import,
+    }
+    log_event(
+        "collection_finished",
+        site=site_slug,
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+        **counts,
+    )
+    return entities, {
+        **counts,
     }
 
 
 def main():
-    api_key = read_unifi_api_key()
-    entities, counts = collect_entities(api_key)
-    if not entities:
-        raise RuntimeError("UniFi API produced no Diode entities")
-    diode = DiodeClient(
-        target=os.getenv(
-            "DIODE_TARGET",
-            "grpc://netbox-diode-ingress-nginx-controller.netbox.svc.cluster.local:80/diode",
-        ),
+    started = time.monotonic()
+    diode_target = os.getenv(
+        "DIODE_TARGET",
+        "grpc://netbox-diode-ingress-nginx-controller.netbox.svc.cluster.local:80/diode",
+    )
+    log_event(
+        "run_start",
         app_name=APP_NAME,
         app_version=APP_VERSION,
-        client_id=os.environ["DIODE_CLIENT_ID"],
-        client_secret=os.environ["DIODE_CLIENT_SECRET"],
+        unifi_host=os.getenv("UNIFI_HOST"),
+        unifi_base_path=os.getenv("UNIFI_API_BASE_PATH", "/proxy/network"),
+        unifi_site=os.getenv("UNIFI_NETWORK_SITE", "default"),
+        include_client_devices=bool_env("UNIFI_INCLUDE_CLIENT_DEVICES", False),
+        import_device_types=bool_env("UNIFI_IMPORT_DEVICE_TYPES", True),
+        netbox_url=os.getenv("NETBOX_URL", "http://netbox.netbox.svc.cluster.local"),
+        netbox_token_configured=bool(os.getenv("NETBOX_TOKEN")),
+        diode_target=diode_target,
     )
-    response = diode.ingest(entities, metadata={"source": APP_NAME, "mode": "unifi-network-api"})
-    print(
-        "unifi discovery ingest succeeded "
-        f"devices={counts['devices']} clients={counts['clients']} networks={counts['networks']} "
-        f"wlans={counts['wlans']} entities={counts['entities']} "
-        f"device_type_import={counts['device_type_import']} response={response!r}"
-    )
+    try:
+        api_key = read_unifi_api_key()
+        entities, counts = collect_entities(api_key)
+        if not entities:
+            raise RuntimeError("UniFi API produced no Diode entities")
+        diode = DiodeClient(
+            target=diode_target,
+            app_name=APP_NAME,
+            app_version=APP_VERSION,
+            client_id=os.environ["DIODE_CLIENT_ID"],
+            client_secret=os.environ["DIODE_CLIENT_SECRET"],
+        )
+        log_event("diode_ingest_start", entity_count=len(entities), entity_types=counts["entity_types"])
+        ingest_started = time.monotonic()
+        response = diode.ingest(entities, metadata={"source": APP_NAME, "mode": "unifi-network-api"})
+        log_event(
+            "diode_ingest_succeeded",
+            elapsed_ms=round((time.monotonic() - ingest_started) * 1000),
+            response_type=response.__class__.__name__,
+            response=repr(response)[:500],
+        )
+        log_event(
+            "run_succeeded",
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+            devices=counts["devices"],
+            clients=counts["clients"],
+            networks=counts["networks"],
+            wlans=counts["wlans"],
+            entities=counts["entities"],
+            entity_types=counts["entity_types"],
+            device_type_import=counts["device_type_import"],
+        )
+    except Exception as exc:
+        log_exception("run_failed", exc, elapsed_ms=round((time.monotonic() - started) * 1000))
+        raise
 
 
 if __name__ == "__main__":

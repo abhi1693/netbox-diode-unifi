@@ -3,11 +3,13 @@ from netbox_diode_unifi.discover import (
     build_device_entities,
     ensure_device_types,
     ip_with_mask,
+    log_event,
     netbox_interface_key,
     netbox_auth_header,
     normalize_mac,
     slugify,
 )
+import json
 from netboxlabs.diode.sdk.ingester import Device, Interface, Manufacturer
 
 
@@ -19,6 +21,16 @@ def test_helpers_normalize_values():
     assert slugify("UniFi Dream Machine") == "unifi-dream-machine"
     assert normalize_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff"
     assert ip_with_mask("192.168.1.10") == "192.168.1.10/32"
+
+
+def test_log_event_redacts_sensitive_fields(capsys):
+    log_event("test_event", token="secret-token", api_key="secret-api-key", safe="visible")
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["event"] == "test_event"
+    assert payload["token"] == "<redacted>"
+    assert payload["api_key"] == "<redacted>"
+    assert payload["safe"] == "visible"
 
 
 def test_netbox_auth_header_preserves_modern_and_legacy_tokens():
