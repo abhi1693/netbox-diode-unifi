@@ -1,6 +1,7 @@
 from netbox_diode_unifi.discover import (
     build_cable_entities,
     build_device_entities,
+    build_ip_range_entities,
     ensure_device_types,
     ip_with_mask,
     log_event,
@@ -389,6 +390,91 @@ def test_build_device_entities_prefers_default_network_ip_for_primary_ip(capsys)
     assert selection_log["reason"] == "default_network"
     assert selection_log["selected_ip"] == "192.168.1.10"
     assert selection_log["selected_from_default_network"] is True
+
+
+def test_build_ip_range_entities_adds_unifi_dhcp_range():
+    entities = build_ip_range_entities(
+        [
+            {
+                "_id": "network1",
+                "name": "Default",
+                "ip_subnet": "192.168.1.0/24",
+                "dhcpd_enabled": True,
+                "dhcpd_start": "192.168.1.6",
+                "dhcpd_stop": "192.168.1.254",
+                "dhcpd_leasetime": 86400,
+            }
+        ]
+    )
+
+    assert [entity_fields(entity)[-1] for entity in entities] == ["ip_range"]
+    ip_range = entities[0].ip_range
+    assert ip_range.start_address == "192.168.1.6"
+    assert ip_range.end_address == "192.168.1.254"
+    assert ip_range.status == "active"
+    assert ip_range.description == "UniFi DHCP range for Default"
+
+
+def test_build_ip_range_entities_skips_missing_unifi_dhcp_range(capsys):
+    entities = build_ip_range_entities(
+        [
+            {
+                "_id": "network1",
+                "name": "Default",
+                "ip_subnet": "192.168.1.0/24",
+                "dhcpd_enabled": True,
+            }
+        ]
+    )
+
+    assert entities == []
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert logs[-1]["event"] == "ip_range_skipped"
+    assert logs[-1]["reason"] == "dhcp_range_missing"
+
+
+def test_build_ip_range_entities_skips_invalid_unifi_dhcp_range(capsys):
+    assert (
+        build_ip_range_entities(
+            [
+                {
+                    "_id": "network1",
+                    "name": "Default",
+                    "ip_subnet": "192.168.1.0/24",
+                    "dhcpd_enabled": True,
+                    "dhcpd_start": "192.168.1.254",
+                    "dhcpd_stop": "192.168.1.6",
+                }
+            ]
+        )
+        == []
+    )
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert logs[-1]["event"] == "ip_range_skipped"
+    assert logs[-1]["reason"] == "dhcp_range_order_invalid"
+
+
+def test_build_ip_range_entities_skips_unifi_dhcp_range_outside_prefix(capsys):
+    assert (
+        build_ip_range_entities(
+            [
+                {
+                    "_id": "network1",
+                    "name": "Default",
+                    "ip_subnet": "192.168.1.0/24",
+                    "dhcpd_enabled": True,
+                    "dhcpd_start": "192.168.2.10",
+                    "dhcpd_stop": "192.168.2.20",
+                }
+            ]
+        )
+        == []
+    )
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert logs[-1]["event"] == "ip_range_skipped"
+    assert logs[-1]["reason"] == "dhcp_range_outside_prefix"
 
 
 def test_build_device_entities_falls_back_to_first_valid_ip_without_default_network(capsys):

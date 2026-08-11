@@ -21,6 +21,7 @@ from netboxlabs.diode.sdk.ingester import (
     Entity,
     GenericObject,
     IPAddress,
+    IPRange,
     Interface,
     MACAddress,
     Manufacturer,
@@ -550,6 +551,82 @@ def prefix_for_network(network, home_site=None):
     )
 
 
+def ip_range_for_network(network):
+    if not network.get("dhcpd_enabled"):
+        log_event("ip_range_skipped", reason="dhcp_disabled", network=clean_name(network.get("name"), network.get("_id")))
+        return None
+
+    start = network.get("dhcpd_start")
+    stop = network.get("dhcpd_stop")
+    if not start or not stop:
+        log_event(
+            "ip_range_skipped",
+            reason="dhcp_range_missing",
+            network=clean_name(network.get("name"), network.get("_id")),
+            has_start=bool(start),
+            has_stop=bool(stop),
+        )
+        return None
+
+    try:
+        start_ip = ipaddress.ip_address(str(start))
+        stop_ip = ipaddress.ip_address(str(stop))
+    except ValueError:
+        log_event(
+            "ip_range_skipped",
+            level="warning",
+            reason="dhcp_range_invalid",
+            network=clean_name(network.get("name"), network.get("_id")),
+            start=start,
+            stop=stop,
+        )
+        return None
+
+    if start_ip.version != stop_ip.version or int(start_ip) > int(stop_ip):
+        log_event(
+            "ip_range_skipped",
+            level="warning",
+            reason="dhcp_range_order_invalid",
+            network=clean_name(network.get("name"), network.get("_id")),
+            start=start,
+            stop=stop,
+        )
+        return None
+
+    prefix = network_prefix_value(network)
+    if prefix is not None and (start_ip not in prefix or stop_ip not in prefix):
+        log_event(
+            "ip_range_skipped",
+            level="warning",
+            reason="dhcp_range_outside_prefix",
+            network=clean_name(network.get("name"), network.get("_id")),
+            prefix=str(prefix),
+            start=str(start_ip),
+            stop=str(stop_ip),
+        )
+        return None
+
+    safe_keys = [
+        "_id",
+        "external_id",
+        "purpose",
+        "networkgroup",
+        "dhcpd_enabled",
+        "dhcpd_start",
+        "dhcpd_stop",
+        "dhcpd_leasetime",
+    ]
+    return IPRange(
+        start_address=str(start_ip),
+        end_address=str(stop_ip),
+        status="active" if network.get("enabled", True) else "deprecated",
+        description=f"UniFi DHCP range for {clean_name(network.get('name'))}",
+        comments=compact_json(filtered_metadata(network, safe_keys)),
+        tags=TAGS,
+        metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+    )
+
+
 def vlan_for_network(network, home_site=None):
     vid = network_vid(network)
     if vid is None:
@@ -704,6 +781,21 @@ def build_prefix_entities(networks, home_site):
     return entities
 
 
+def build_ip_range_entities(networks):
+    entities = []
+    seen = set()
+    for network in networks:
+        ip_range = ip_range_for_network(network)
+        if ip_range is None:
+            continue
+        key = (ip_range.start_address, ip_range.end_address)
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(Entity(ip_range=ip_range))
+    return entities
+
+
 def build_wan_circuit_entities(networks, home_site):
     entities = []
     seen_providers = set()
@@ -838,6 +930,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
     vlan_entities, vlan_by_id = build_vlan_entities(networks, home_site)
     entities.extend(vlan_entities)
     entities.extend(build_prefix_entities(networks, home_site))
+    entities.extend(build_ip_range_entities(networks))
     entities.extend(build_wan_circuit_entities(networks, home_site))
     entities.extend(build_wireless_lan_entities(wlans, vlan_by_id, home_site))
 
