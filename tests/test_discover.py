@@ -10,6 +10,7 @@ from netbox_diode_unifi.discover import (
     netbox_auth_header,
     normalize_mac,
     slugify,
+    unifi_device_type_model,
 )
 import json
 from netboxlabs.diode.sdk.ingester import Device, Interface, Manufacturer
@@ -23,6 +24,9 @@ def test_helpers_normalize_values():
     assert slugify("UniFi Dream Machine") == "unifi-dream-machine"
     assert normalize_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff"
     assert ip_with_mask("192.168.1.10") == "192.168.1.10/32"
+    assert unifi_device_type_model({"model": "UDMPRO"}) == "UniFi Dream Machine Pro"
+    assert unifi_device_type_model({"model": "USAGGPRO"}) == "UniFi Switch Pro Aggregation"
+    assert unifi_device_type_model({"model": "UNKNOWNMODEL"}) == "UNKNOWNMODEL"
 
 
 def test_log_event_redacts_sensitive_fields(capsys):
@@ -51,7 +55,7 @@ def test_netbox_auth_header_preserves_modern_and_legacy_tokens():
     assert netbox_auth_header("abc123") == "Token abc123"
 
 
-def test_ensure_device_types_uses_netbox_manufacturer_slug(monkeypatch):
+def test_ensure_device_types_uses_mapped_unifi_device_type_name(monkeypatch):
     calls = []
 
     def fake_netbox_request(method, path, payload=None, token=None):
@@ -68,7 +72,36 @@ def test_ensure_device_types_uses_netbox_manufacturer_slug(monkeypatch):
         "failed": 0,
     }
     assert calls == [
-        ("GET", "/api/dcim/device-types/?manufacturer=ubiquiti&model=UDMPRO&limit=1", None, "nbt_example.secret")
+        ("GET", "/api/dcim/device-types/?model=UniFi+Dream+Machine+Pro&limit=1", None, "nbt_example.secret")
+    ]
+
+
+def test_ensure_device_types_imports_mapped_unifi_device_type_name(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None):
+        calls.append((method, path, payload, token))
+        if method == "GET":
+            return {"count": 0, "results": []}
+        return {"message": "Imported: UniFi Switch Pro Aggregation"}
+
+    monkeypatch.setenv("NETBOX_TOKEN", "nbt_example.secret")
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert ensure_device_types([{"model": "USAGGPRO"}]) == {
+        "checked": 1,
+        "imported": 1,
+        "missing": 0,
+        "failed": 0,
+    }
+    assert calls == [
+        ("GET", "/api/dcim/device-types/?model=UniFi+Switch+Pro+Aggregation&limit=1", None, "nbt_example.secret"),
+        (
+            "POST",
+            "/api/plugins/meta-types/device-type-import/",
+            {"name": "UniFi Switch Pro Aggregation"},
+            "nbt_example.secret",
+        ),
     ]
 
 
@@ -236,6 +269,28 @@ def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
     assert ip_entity.ip_address.assigned_object_interface.name == "mgmt"
     assert ip_entity.ip_address.assigned_object_interface.device.name == "AP Test"
     assert ip_entity.ip_address.assigned_object_interface.parent.name == "eth0"
+
+
+def test_build_device_entities_uses_mapped_device_type_model():
+    entities = build_device_entities(
+        devices=[
+            {
+                "_id": "dev1",
+                "name": "UDM-Pro",
+                "model": "UDMPRO",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "state": 1,
+                "type": "udm",
+            }
+        ],
+        clients=[],
+        networks=[],
+        wlans=[],
+    )
+
+    device_entity = next(entity for entity in entities if "device" in entity_fields(entity))
+    assert device_entity.device.device_type.model == "UniFi Dream Machine Pro"
+    assert device_entity.device.device_type.slug == "unifi-dream-machine-pro"
 
 
 def test_build_device_entities_prefers_default_network_ip_for_primary_ip(capsys):

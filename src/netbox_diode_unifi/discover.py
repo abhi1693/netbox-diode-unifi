@@ -39,6 +39,13 @@ TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
 SENSITIVE_LOG_KEYS = {"token", "api_key", "authorization", "password", "client_secret"}
+UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME = {
+    "U6ENT": "UniFi U6 Enterprise",
+    "UAPL6": "UniFi U6+",
+    "UDMPRO": "UniFi Dream Machine Pro",
+    "USAGGPRO": "UniFi Switch Pro Aggregation",
+    "USL24PB": "UniFi Switch 24 PoE",
+}
 
 
 def is_sensitive_log_key(key):
@@ -102,6 +109,11 @@ def clean_name(*values):
         if value:
             return str(value).strip()
     return "unknown"
+
+
+def unifi_device_type_model(device):
+    raw_model = clean_name(device.get("model"), "UniFi Device")
+    return UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME.get(raw_model.upper(), raw_model)
 
 
 def normalize_mac(value):
@@ -343,11 +355,11 @@ def ensure_device_types(devices):
             device_count=len(devices),
         )
         return {"checked": 0, "imported": 0, "missing": 0, "failed": 0}
-    models = sorted({clean_name(device.get("model")) for device in devices if device.get("model")})
+    models = sorted({unifi_device_type_model(device) for device in devices if device.get("model")})
     result = {"checked": len(models), "imported": 0, "missing": 0, "failed": 0}
     log_event("device_type_import_start", model_count=len(models), models=models)
     for model in models:
-        query = urllib.parse.urlencode({"manufacturer": UBIQUITI.slug, "model": model, "limit": 1})
+        query = urllib.parse.urlencode({"model": model, "limit": 1})
         try:
             existing = netbox_request("GET", f"/api/dcim/device-types/?{query}", token=token)
             if existing and existing.get("count", 0) > 0:
@@ -571,7 +583,7 @@ def device_serial(device):
 
 def make_device(device, home_site):
     mac = normalize_mac(device.get("mac") or device.get("macAddress"))
-    model = clean_name(device.get("model"), "UniFi Device")
+    model = unifi_device_type_model(device)
     name = clean_name(device.get("name"), device.get("hostname"), model, mac)
     return Device(
         name=name,
