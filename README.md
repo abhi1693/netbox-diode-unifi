@@ -1,101 +1,164 @@
 # NetBox Diode UniFi Discovery
 
-UniFi Network API inventory collector for NetBox Diode.
+[![Container Image](https://github.com/abhi1693/netbox-diode-unifi/actions/workflows/container.yml/badge.svg)](https://github.com/abhi1693/netbox-diode-unifi/actions/workflows/container.yml)
+[![Release](https://img.shields.io/github/v/release/abhi1693/netbox-diode-unifi?display_name=tag&sort=semver)](https://github.com/abhi1693/netbox-diode-unifi/releases)
+[![GHCR Image](https://img.shields.io/badge/GHCR-netbox--diode--unifi-blue?logo=github)](https://github.com/abhi1693/netbox-diode-unifi/pkgs/container/netbox-diode-unifi)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-linux%2Farm64-lightgrey)](https://github.com/abhi1693/netbox-diode-unifi/actions/workflows/container.yml)
 
-The collector reads UniFi inventory from the UniFi Network APIs under
-`/proxy/network/api/s/<site>` and `/proxy/network/integration/v1`, then sends
-NetBox entities to Diode for reconciliation into NetBox.
+UniFi Network inventory collector for NetBox Diode.
 
-## Runtime
+This project discovers infrastructure data from UniFi Network APIs and sends
+NetBox entities to Diode for reconciliation. It is built for branch-based
+review workflows where discovered data lands in a NetBox branch first, then can
+be inspected, reconciled, and merged intentionally.
 
-The Kubernetes deployment in `home-lab` runs the published container image and
-provides configuration through environment variables.
+## What It Discovers
 
-Required environment variables:
+The collector reads from the richer UniFi Network API paths under
+`/proxy/network/api/s/<site>` and supplements them with the official
+`/proxy/network/integration/v1` endpoints where useful.
 
-- `UNIFI_HOST`, for example `https://192.168.3.1`
-- `DIODE_CLIENT_ID`
-- `DIODE_CLIENT_SECRET`
+It currently models:
 
-Optional environment variables:
+- UniFi infrastructure devices as NetBox devices with manufacturer, role,
+  platform, firmware, serial-aware identity, state, management interface, and
+  primary IP data.
+- Missing Ubiquiti device types through `netbox-metatype-importer` before Diode
+  ingestion, using the NetBox API and branch header.
+- Switch, gateway, and AP interfaces from UniFi port and uplink data, including
+  media, speed, PoE, SFP module, STP, VLAN, uplink, and parent-interface detail
+  where UniFi exposes it.
+- Device management IPs, preferring addresses from the UniFi Default network
+  because that network is treated as the management network.
+- VLANs, prefixes, DHCP IP ranges, WLANs, VPN tunnels, VPN prefixes, WAN
+  providers, circuits, circuit terminations, and selected cable relationships.
+- LLDP/uplink cables when both endpoints are visible in the same UniFi payload.
+- Infrastructure MAC addresses assigned to each device `mgmt` interface for
+  stable Diode reconciliation.
 
-- `UNIFI_API_BASE_PATH`, default `/proxy/network`
-- `UNIFI_NETWORK_SITE`, default `default`
-- `UNIFI_VERIFY_TLS`, default `false`
-- `UNIFI_API_KEY`, direct UniFi API key
-- `UNIFI_SECRET_NAMESPACE`, default `kube-public`
-- `UNIFI_SECRET_NAME`, default `external-dns-unifi-sops`
-- `UNIFI_SECRET_KEY`, default `api-key`
-- `UNIFI_IMPORT_DEVICE_TYPES`, default `true`
-- `UNIFI_INCLUDE_CLIENT_DEVICES`, default `false`
-- `UNIFI_PRUNE_STALE`, default `true`; remove supported discovery-owned NetBox
-  objects that are absent from the current UniFi payload
-- `UNIFI_PRUNE_MAX_DELETE`, default `100`; refuse a run before deletion when
-  the complete stale-object plan exceeds this safety limit
-- `UNIFI_VPN_ENDPOINTS`, optional comma-separated UniFi VPN endpoint templates.
-  Templates may use `{site}` and default to the known legacy/v2 VPN collection
-  paths. Missing endpoints are skipped because UniFi exposes VPN data
-  differently across controller versions.
-- `DIODE_TARGET`, default `grpc://netbox-diode-ingress-nginx-controller.netbox.svc.cluster.local:80/diode`
-- `NETBOX_SITE_NAME`, default `Home`
-- `NETBOX_SITE_SLUG`, default `home`
-- `NETBOX_URL`, default `http://netbox.netbox.svc.cluster.local`
-- `NETBOX_TOKEN`, optional NetBox API token used to import missing device
-  types through `netbox-metatype-importer`
+Client devices are intentionally disabled by default. The collector does not
+emit standalone client MAC/IP records unless client modeling is explicitly
+enabled.
 
-When `UNIFI_API_KEY` is not set, the collector reads the API key from the
-configured Kubernetes Secret using its pod ServiceAccount token.
+## Reconciliation Model
 
-Client devices are not modeled by default, and no standalone client MAC/IP
-records are emitted while client modeling is disabled. Set
-`UNIFI_INCLUDE_CLIENT_DEVICES=true` only after infrastructure devices are
-accurate enough to model client interfaces and their assigned addresses.
+The collector emits discovered records with the `diode-discovery` and `unifi`
+tags. After a successful Diode ingestion it can prune supported stale records
+from the target NetBox branch when tagged objects are no longer present in the
+current UniFi payload.
 
-Infrastructure device MAC addresses are assigned to and selected as the primary
-MAC of each device's virtual `mgmt` interface so repeated Diode runs reconcile
-the same NetBox object.
+Current prune coverage:
 
-After a successful Diode ingestion, the collector compares the desired payload
-with the `diode` branch and removes stale objects only when they carry both the
-`diode-discovery` and `unifi` tags. The prune phase currently covers VPN
-tunnels, WLANs, IP ranges, IP addresses, prefixes, MAC addresses, and VLANs.
-It refuses to run when discovery emits no devices or when the deletion plan
-exceeds `UNIFI_PRUNE_MAX_DELETE`. Devices, interfaces, circuits, and cables are
-not pruned until their dependency-aware deletion paths are implemented.
+- VPN tunnels
+- WLANs
+- IP ranges
+- IP addresses
+- Prefixes
+- MAC addresses
+- VLANs
 
-No environment-specific aliases are built into the collector. UniFi names and
-models are emitted as discovered.
+Devices, interfaces, circuits, and cables are not pruned yet because they need
+dependency-aware deletion order.
 
 ## Container Image
 
-The production image is built from `Dockerfile` and published by
+The production image is built by
 `.github/workflows/container.yml` through the shared
 `abhi1693/actions/.github/workflows/docker-build-push.yml@master` workflow.
-Pushes to `master` publish a linux/arm64 image as:
+
+Release images are published to GHCR:
 
 ```text
-ghcr.io/abhi1693/netbox-diode-unifi:<full-commit-sha>
+ghcr.io/abhi1693/netbox-diode-unifi:<version>
 ```
 
-The image runs as UID/GID `1000` and starts the collector through the
-`netbox-diode-unifi` console script.
+The image is linux/arm64, runs as UID/GID `1000`, and starts the collector with
+the `netbox-diode-unifi` console script.
 
-VPN data is collected from the official VPN server and site-to-site endpoints
-and enriched with detailed VPN network configuration records from
-`networkconf`. Discovered OpenVPN, L2TP, WireGuard, and IPsec records create a
-`UniFi VPN` tunnel group and tunnel objects. VPN pool networks and DHCP ranges
-are emitted through the normal prefix and IP-range discovery, while explicit
-site-to-site remote CIDRs are emitted as VPN prefixes. If UniFi exposes no VPN
-records, the collector logs the skipped optional endpoints and emits no VPN
-objects.
+## Runtime Configuration
 
-WAN circuit cabling is modeled only when UniFi exposes a matching local gateway
-WAN port. The collector cables the discovered circuit termination to that
-interface and logs a skip when no explicit WAN endpoint can be matched.
+Required environment variables:
 
-## Local validation
+| Variable | Description |
+| --- | --- |
+| `UNIFI_HOST` | UniFi gateway/controller base URL, for example `https://192.168.3.1`. |
+| `DIODE_CLIENT_ID` | Diode OAuth client ID. |
+| `DIODE_CLIENT_SECRET` | Diode OAuth client secret. |
+
+Optional environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `UNIFI_API_BASE_PATH` | `/proxy/network` | UniFi Network API base path. |
+| `UNIFI_NETWORK_SITE` | `default` | UniFi site slug. |
+| `UNIFI_VERIFY_TLS` | `false` | Verify UniFi TLS certificates. |
+| `UNIFI_API_KEY` | unset | Direct UniFi API key. If unset, the collector reads the configured Kubernetes Secret. |
+| `UNIFI_SECRET_NAMESPACE` | `kube-public` | Namespace for the UniFi API key Secret. |
+| `UNIFI_SECRET_NAME` | `external-dns-unifi-sops` | UniFi API key Secret name. |
+| `UNIFI_SECRET_KEY` | `api-key` | UniFi API key field in the Secret. |
+| `UNIFI_IMPORT_DEVICE_TYPES` | `true` | Import missing device types through `netbox-metatype-importer`. |
+| `UNIFI_INCLUDE_CLIENT_DEVICES` | `false` | Emit client devices and client MAC/IP records. |
+| `UNIFI_PRUNE_STALE` | `true` | Remove supported tagged records absent from the current UniFi payload. |
+| `UNIFI_PRUNE_MAX_DELETE` | `100` | Refuse pruning if the complete delete plan exceeds this count. |
+| `UNIFI_VPN_ENDPOINTS` | built in list | Comma-separated UniFi VPN endpoint templates. Templates may use `{site}`. |
+| `DIODE_TARGET` | `grpc://netbox-diode-ingress-nginx-controller.netbox.svc.cluster.local:80/diode` | Diode gRPC target. |
+| `NETBOX_SITE_NAME` | `Home` | NetBox site name for discovered objects. |
+| `NETBOX_SITE_SLUG` | `home` | NetBox site slug for discovered objects. |
+| `NETBOX_URL` | `http://netbox.netbox.svc.cluster.local` | NetBox API base URL. |
+| `NETBOX_TOKEN` | unset | NetBox API token for branch lookup, device-type import, prechecks, and stale pruning. |
+| `NETBOX_BRANCH_NAME` | `diode` | NetBox Branching branch name used for API writes. |
+| `NETBOX_BRANCH_IDENTIFIER` | unset | Explicit branch schema ID. When set, branch lookup by name is skipped. |
+
+When `UNIFI_API_KEY` is not set, the collector reads the API key from the
+configured Kubernetes Secret using the pod ServiceAccount token.
+
+## Kubernetes Deployment
+
+The primary deployment target is the `home-lab` Fleet app at:
+
+```text
+kubernetes/projects/home-automation/apps/netbox-unifi-api-discovery
+```
+
+That deployment uses the local registry mirror form:
+
+```text
+registry.home/ghcr.io/abhi1693/netbox-diode-unifi:<version>
+```
+
+The pod runs as non-root with a read-only root filesystem and uses Kubernetes
+network policy to allow only the UniFi gateway, NetBox, Diode ingress, DNS, and
+Kubernetes API traffic required by the collector.
+
+## Local Development
+
+Create an editable install with test dependencies:
 
 ```sh
 python -m pip install -e '.[test]'
 pytest
 ```
+
+Build and smoke-test the container locally:
+
+```sh
+DOCKER_BUILDKIT=1 docker build -t netbox-diode-unifi:test .
+docker run --rm --read-only --tmpfs /tmp --user 1000:1000 \
+  --entrypoint python netbox-diode-unifi:test \
+  -c 'import netbox_diode_unifi.discover as d; print(d.APP_NAME, d.APP_VERSION)'
+```
+
+## Operational Notes
+
+- UniFi object names and model values are emitted as discovered. The collector
+  avoids environment-specific aliases and leaves reconciliation decisions to the
+  NetBox branch review process.
+- Device lookups prefer discovered serial numbers and fall back to names only
+  when serial lookup misses.
+- Diode handles reconciliation of present objects. Stale-object deletion is a
+  separate collector post-ingest step with tag and maximum-delete safeguards.
+- VPN data is assembled from official VPN endpoints and detailed `networkconf`
+  records because UniFi exposes different VPN shapes across controller versions.
+- WAN circuit cabling is emitted only when UniFi exposes enough endpoint data to
+  match a discovered local gateway WAN interface.
