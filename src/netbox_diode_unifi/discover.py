@@ -40,11 +40,11 @@ UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
 SENSITIVE_LOG_KEYS = {"token", "api_key", "authorization", "password", "client_secret"}
 UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME = {
-    "U6ENT": "UniFi U6 Enterprise",
-    "UAPL6": "UniFi U6+",
+    "U6ENT": "U6 Enterprise",
+    "UAPL6": "U6+",
     "UDMPRO": "UniFi Dream Machine Pro",
     "USAGGPRO": "UniFi Switch Pro Aggregation",
-    "USL24PB": "UniFi Switch 24 PoE",
+    "USL24PB": "UniFi Switch 24 PoE Gen2",
 }
 UNIFI_DEVICE_TYPE_LIBRARY_NAME_BY_SHORTNAME = {
     "U6ENT": "U6-Enterprise.yaml",
@@ -321,6 +321,9 @@ def netbox_request(method, path, payload=None, token=None):
         return None
     data = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/json", "Authorization": netbox_auth_header(token)}
+    branch_name = os.getenv("NETBOX_BRANCH_NAME", "diode").strip()
+    if branch_name:
+        headers["X-NetBox-Branch"] = branch_name
     if payload is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"{base_url}{path}", data=data, method=method, headers=headers)
