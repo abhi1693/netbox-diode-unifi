@@ -56,6 +56,10 @@ remote network prefixes when remote CIDRs are present. If UniFi does not expose
 VPN collections, the collector logs the skipped optional endpoints and emits no
 VPN objects.
 
+WAN circuit cabling is modeled only when UniFi exposes a matching local gateway
+WAN port. The collector cables the discovered circuit termination to that
+interface and logs a skip when no explicit WAN endpoint can be matched.
+
 ## Local validation
 
 ```sh

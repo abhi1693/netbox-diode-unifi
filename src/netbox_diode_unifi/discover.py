@@ -865,12 +865,8 @@ def build_ip_range_entities(networks):
     return entities
 
 
-def build_wan_circuit_entities(networks, home_site):
-    entities = []
-    seen_providers = set()
-    seen_circuits = set()
-    added_circuit_type = False
-    circuit_type = CircuitType(
+def wan_circuit_type():
+    return CircuitType(
         name="Internet",
         slug="internet",
         color="2196f3",
@@ -878,70 +874,247 @@ def build_wan_circuit_entities(networks, home_site):
         tags=TAGS,
         metadata={"source": APP_NAME},
     )
+
+
+def wan_provider_name(network):
+    return clean_name(network.get("name"), network.get("wan_networkgroup"), "UniFi WAN")
+
+
+def wan_circuit_id(network, provider_name=None):
+    return clean_name(network.get("external_id"), network.get("_id"), provider_name or wan_provider_name(network))
+
+
+def wan_circuit_objects(network, home_site):
+    provider_name = wan_provider_name(network)
+    provider = Provider(
+        name=provider_name,
+        slug=slugify(provider_name),
+        description="Provider inferred from UniFi WAN network",
+        tags=TAGS,
+        metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+    )
+    capabilities = network.get("wan_provider_capabilities") or {}
+    circuit_type = wan_circuit_type()
+    circuit = Circuit(
+        cid=wan_circuit_id(network, provider_name),
+        provider=provider,
+        type=circuit_type,
+        status="active" if network.get("enabled", True) else "offline",
+        commit_rate=capabilities.get("download_kilobits_per_second") or capabilities.get("upload_kilobits_per_second"),
+        description=f"UniFi WAN {provider_name}",
+        comments=compact_json(
+            filtered_metadata(
+                network,
+                [
+                    "purpose",
+                    "wan_networkgroup",
+                    "wan_type",
+                    "wan_ip",
+                    "wan_gateway",
+                    "wan_netmask",
+                    "wan_vlan",
+                    "wan_vlan_enabled",
+                    "wan_load_balance_type",
+                    "wan_load_balance_weight",
+                    "wan_failover_priority",
+                    "wan_smartq_enabled",
+                ],
+            )
+            | {"wan_provider_capabilities": capabilities}
+        ),
+        tags=TAGS,
+        metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+    )
+    term = CircuitTermination(
+        circuit=circuit,
+        term_side="A",
+        termination_site=home_site,
+        port_speed=capabilities.get("download_kilobits_per_second"),
+        upstream_speed=capabilities.get("upload_kilobits_per_second"),
+        description=f"UniFi WAN termination for {provider_name}",
+        tags=TAGS,
+        metadata={"source": APP_NAME},
+    )
+    return provider, circuit_type, circuit, term
+
+
+def build_wan_circuit_entities(networks, home_site):
+    entities = []
+    seen_providers = set()
+    seen_circuits = set()
+    added_circuit_type = False
+    circuit_type = wan_circuit_type()
     for network in networks:
         if network.get("purpose") != "wan":
             continue
-        provider_name = clean_name(network.get("name"), network.get("wan_networkgroup"), "UniFi WAN")
-        provider = Provider(
-            name=provider_name,
-            slug=slugify(provider_name),
-            description="Provider inferred from UniFi WAN network",
-            tags=TAGS,
-            metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
-        )
-        if provider_name not in seen_providers:
-            seen_providers.add(provider_name)
+        provider, _circuit_type, circuit, term = wan_circuit_objects(network, home_site)
+        if provider.name not in seen_providers:
+            seen_providers.add(provider.name)
             entities.append(Entity(provider=provider))
-        capabilities = network.get("wan_provider_capabilities") or {}
-        cid = clean_name(network.get("external_id"), network.get("_id"), provider_name)
-        if cid in seen_circuits:
+        if circuit.cid in seen_circuits:
             continue
-        seen_circuits.add(cid)
-        circuit = Circuit(
-            cid=cid,
-            provider=provider,
-            type=circuit_type,
-            status="active" if network.get("enabled", True) else "offline",
-            commit_rate=capabilities.get("download_kilobits_per_second") or capabilities.get("upload_kilobits_per_second"),
-            description=f"UniFi WAN {provider_name}",
-            comments=compact_json(
-                filtered_metadata(
-                    network,
-                    [
-                        "purpose",
-                        "wan_networkgroup",
-                        "wan_type",
-                        "wan_ip",
-                        "wan_gateway",
-                        "wan_netmask",
-                        "wan_vlan",
-                        "wan_vlan_enabled",
-                        "wan_load_balance_type",
-                        "wan_load_balance_weight",
-                        "wan_failover_priority",
-                        "wan_smartq_enabled",
-                    ],
-                )
-                | {"wan_provider_capabilities": capabilities}
-            ),
-            tags=TAGS,
-            metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
-        )
-        term = CircuitTermination(
-            circuit=circuit,
-            term_side="A",
-            termination_site=home_site,
-            port_speed=capabilities.get("download_kilobits_per_second"),
-            upstream_speed=capabilities.get("upload_kilobits_per_second"),
-            description=f"UniFi WAN termination for {provider_name}",
-            tags=TAGS,
-            metadata={"source": APP_NAME},
-        )
+        seen_circuits.add(circuit.cid)
         if not added_circuit_type:
             entities.append(Entity(circuit_type=circuit_type))
             added_circuit_type = True
         entities.append(Entity(circuit=circuit))
         entities.append(Entity(circuit_termination=term))
+    return entities
+
+
+def normalized_token_values(*values):
+    tokens = set()
+    for value in values:
+        if value is None:
+            continue
+        raw = str(value).strip()
+        if not raw:
+            continue
+        compact = re.sub(r"[^a-z0-9]+", "", raw.lower())
+        if compact:
+            tokens.add(compact)
+    return tokens
+
+
+def wan_network_tokens(network):
+    return normalized_token_values(
+        network.get("name"),
+        network.get("wan_networkgroup"),
+        network.get("networkgroup"),
+        network.get("ifname"),
+        network.get("interface"),
+        network.get("wan_interface"),
+        network.get("wan_ifname"),
+        network.get("wan_port"),
+    )
+
+
+def port_wan_tokens(port):
+    return normalized_token_values(
+        port.get("name"),
+        port.get("ifname"),
+        port.get("port_name"),
+        port.get("network_name"),
+        port.get("network"),
+        port.get("op_mode"),
+    )
+
+
+def port_looks_like_wan(port):
+    values = [
+        port.get("name"),
+        port.get("ifname"),
+        port.get("port_name"),
+        port.get("network_name"),
+        port.get("network"),
+        port.get("op_mode"),
+        port.get("purpose"),
+    ]
+    return any("wan" in str(value).lower() for value in values if value is not None)
+
+
+def device_looks_like_gateway(device):
+    values = [
+        device.get("type"),
+        device.get("model"),
+        device.get("displayable_version"),
+        device.get("name"),
+    ]
+    return any(token in str(value).lower() for value in values if value is not None for token in ("udm", "ugw", "uxg", "gateway"))
+
+
+def find_wan_circuit_interface(network, devices, port_by_device_mac_and_idx):
+    network_tokens = wan_network_tokens(network)
+    candidates = []
+    for device in devices:
+        device_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
+        if not device_mac:
+            continue
+        for port in device.get("port_table") or []:
+            port_idx = port.get("port_idx")
+            iface = port_by_device_mac_and_idx.get((device_mac, port_idx))
+            if iface is None:
+                continue
+            score = 0
+            has_wan_evidence = False
+            if network_tokens and network_tokens.intersection(port_wan_tokens(port)):
+                score += 20
+                has_wan_evidence = True
+            if port_looks_like_wan(port):
+                score += 10
+                has_wan_evidence = True
+            if device_looks_like_gateway(device):
+                score += 5
+            if port.get("up", True):
+                score += 1
+            if not has_wan_evidence:
+                continue
+            candidates.append((score, device.get("name") or device.get("hostname") or device_mac, port_idx, iface, device))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda item: (-item[0], str(item[1]), item[2] if item[2] is not None else 9999))
+    return candidates[0][3], candidates[0][4]
+
+
+def build_wan_circuit_cable_entities(networks, devices, home_site, port_by_device_mac_and_idx, existing_cabled_interfaces=None):
+    entities = []
+    seen_interfaces = set()
+    existing_cabled_interfaces = existing_cabled_interfaces or set()
+    for network in networks:
+        if network.get("purpose") != "wan":
+            continue
+        _provider, _circuit_type, circuit, term = wan_circuit_objects(network, home_site)
+        iface, device = find_wan_circuit_interface(network, devices, port_by_device_mac_and_idx)
+        if iface is None:
+            log_event(
+                "wan_circuit_cable_skipped",
+                reason="missing_discovered_wan_interface",
+                circuit=wan_circuit_id(network),
+                provider=wan_provider_name(network),
+                network_id=network.get("_id") or network.get("id"),
+            )
+            continue
+        interface_key = netbox_interface_key(iface.device.name, iface.name)
+        if interface_key in existing_cabled_interfaces:
+            log_event(
+                "wan_circuit_cable_skipped",
+                reason="endpoint_already_cabled",
+                circuit=circuit.cid,
+                device=iface.device.name,
+                interface=iface.name,
+            )
+            continue
+        if interface_key in seen_interfaces:
+            log_event(
+                "wan_circuit_cable_skipped",
+                reason="duplicate_discovered_endpoint",
+                circuit=circuit.cid,
+                device=iface.device.name,
+                interface=iface.name,
+            )
+            continue
+        seen_interfaces.add(interface_key)
+        cable = Cable(
+            type="cat6" if iface.type and iface.type.endswith("base-t") else "dac-active",
+            a_terminations=[GenericObject(object_circuit_termination=term)],
+            b_terminations=[GenericObject(object_interface=iface)],
+            status="connected" if circuit.status == "active" else "planned",
+            label=f"UniFi WAN {circuit.cid} to {iface.device.name} {iface.name}"[:100],
+            description="Cable/link inferred from UniFi WAN circuit and gateway port data",
+            comments=compact_json(
+                filtered_metadata(
+                    network,
+                    ["purpose", "wan_networkgroup", "wan_type", "wan_ip", "wan_gateway", "wan_vlan", "wan_vlan_enabled"],
+                )
+            ),
+            tags=TAGS,
+            metadata={
+                "source": APP_NAME,
+                "network_id": network.get("_id") or network.get("id"),
+                "device_serial": device_serial(device) if device else None,
+            },
+        )
+        entities.append(Entity(cable=cable))
     return entities
 
 
@@ -1324,6 +1497,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
         entities.append(Entity(device=device_obj))
 
     existing_cabled_interfaces = existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx)
+    entities.extend(build_wan_circuit_cable_entities(networks, devices, home_site, port_by_device_mac_and_idx, existing_cabled_interfaces))
     entities.extend(build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces))
     entities.extend(build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx, seen_macs))
     return entities

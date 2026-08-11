@@ -509,6 +509,98 @@ def test_build_vpn_entities_skips_when_unifi_has_no_vpn_configs(capsys):
     assert logs[-1]["reason"] == "no_vpn_configs"
 
 
+def test_build_device_entities_adds_wan_circuit_cable():
+    entities = build_device_entities(
+        devices=[
+            {
+                "_id": "dev1",
+                "name": "UDM-Pro",
+                "model": "UDMPRO",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "state": 1,
+                "type": "udm",
+                "port_table": [
+                    {
+                        "port_idx": 9,
+                        "name": "WAN",
+                        "ifname": "eth8",
+                        "media": "GE",
+                        "speed": 1000,
+                        "up": True,
+                    }
+                ],
+            }
+        ],
+        clients=[],
+        networks=[
+            {
+                "_id": "wan1",
+                "name": "WAN",
+                "purpose": "wan",
+                "external_id": "wan-primary",
+                "enabled": True,
+                "wan_networkgroup": "WAN",
+                "wan_provider_capabilities": {
+                    "download_kilobits_per_second": 1000000,
+                    "upload_kilobits_per_second": 500000,
+                },
+            }
+        ],
+        wlans=[],
+    )
+
+    cable_entities = [entity for entity in entities if "cable" in entity_fields(entity)]
+    assert len(cable_entities) == 1
+    cable = cable_entities[0].cable
+    assert cable.label == "UniFi WAN wan-primary to UDM-Pro WAN"
+    assert cable.type == "cat6"
+    assert cable.a_terminations[0].object_circuit_termination.circuit.cid == "wan-primary"
+    assert cable.b_terminations[0].object_interface.device.name == "UDM-Pro"
+    assert cable.b_terminations[0].object_interface.name == "WAN"
+
+
+def test_build_device_entities_skips_wan_circuit_cable_without_discovered_wan_interface(capsys):
+    entities = build_device_entities(
+        devices=[
+            {
+                "_id": "dev1",
+                "name": "UDM-Pro",
+                "model": "UDMPRO",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "state": 1,
+                "type": "udm",
+                "port_table": [
+                    {
+                        "port_idx": 1,
+                        "name": "LAN 1",
+                        "ifname": "eth0",
+                        "media": "GE",
+                        "speed": 1000,
+                        "up": True,
+                    }
+                ],
+            }
+        ],
+        clients=[],
+        networks=[
+            {
+                "_id": "wan1",
+                "name": "ISP",
+                "purpose": "wan",
+                "external_id": "wan-primary",
+                "enabled": True,
+            }
+        ],
+        wlans=[],
+    )
+
+    assert [entity for entity in entities if "cable" in entity_fields(entity)] == []
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    skip_log = next(log for log in logs if log["event"] == "wan_circuit_cable_skipped")
+    assert skip_log["reason"] == "missing_discovered_wan_interface"
+    assert skip_log["circuit"] == "wan-primary"
+
+
 def test_build_device_entities_falls_back_to_first_valid_ip_without_default_network(capsys):
     entities = build_device_entities(
         devices=[
