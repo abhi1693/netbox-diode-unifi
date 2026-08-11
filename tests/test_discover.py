@@ -4,6 +4,7 @@ from netbox_diode_unifi.discover import (
     ensure_device_types,
     ip_with_mask,
     log_event,
+    netbox_branch_header_value,
     netbox_device_lookup,
     netbox_interface_key,
     netbox_interface_is_cabled,
@@ -60,6 +61,30 @@ def test_netbox_auth_header_preserves_modern_and_legacy_tokens():
     assert netbox_auth_header("nbt_example.secret") == "Bearer nbt_example.secret"
     assert netbox_auth_header("Token abc123") == "Token abc123"
     assert netbox_auth_header("abc123") == "Token abc123"
+
+
+def test_netbox_branch_header_value_resolves_schema_id(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None, use_branch=True):
+        calls.append((method, path, payload, token, use_branch))
+        return {"results": [{"id": 6, "name": "diode", "schema_id": "k5kvmgkt"}]}
+
+    monkeypatch.delenv("NETBOX_BRANCH_IDENTIFIER", raising=False)
+    monkeypatch.setenv("NETBOX_BRANCH_NAME", "diode")
+    monkeypatch.setattr("netbox_diode_unifi.discover._NETBOX_BRANCH_HEADER_VALUE", None)
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert netbox_branch_header_value("nbt_example.secret") == "k5kvmgkt"
+    assert calls == [
+        (
+            "GET",
+            "/api/plugins/branching/branches/?name=diode&limit=1",
+            None,
+            "nbt_example.secret",
+            False,
+        )
+    ]
 
 
 def test_ensure_device_types_uses_mapped_unifi_device_type_name(monkeypatch):

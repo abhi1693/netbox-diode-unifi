@@ -39,6 +39,8 @@ TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
 SENSITIVE_LOG_KEYS = {"token", "api_key", "authorization", "password", "client_secret"}
+NETBOX_BRANCH_HEADER = "X-NetBox-Branch"
+_NETBOX_BRANCH_HEADER_VALUE = None
 UNIFI_DEVICE_TYPE_MODEL_BY_SHORTNAME = {
     "U6ENT": "U6 Enterprise",
     "UAPL6": "U6+",
@@ -313,7 +315,29 @@ def unifi_get(api_key, path, params=None):
         raise
 
 
-def netbox_request(method, path, payload=None, token=None):
+def netbox_branch_header_value(token):
+    global _NETBOX_BRANCH_HEADER_VALUE
+    if _NETBOX_BRANCH_HEADER_VALUE is not None:
+        return _NETBOX_BRANCH_HEADER_VALUE
+    configured = os.getenv("NETBOX_BRANCH_IDENTIFIER")
+    if configured:
+        _NETBOX_BRANCH_HEADER_VALUE = configured.strip()
+        return _NETBOX_BRANCH_HEADER_VALUE
+    branch_name = os.getenv("NETBOX_BRANCH_NAME", "diode").strip()
+    if not branch_name:
+        _NETBOX_BRANCH_HEADER_VALUE = ""
+        return _NETBOX_BRANCH_HEADER_VALUE
+    query = urllib.parse.urlencode({"name": branch_name, "limit": 1})
+    response = netbox_request("GET", f"/api/plugins/branching/branches/?{query}", token=token, use_branch=False)
+    branch = (response.get("results") or [None])[0] if response else None
+    if not branch or not branch.get("schema_id"):
+        raise RuntimeError(f"NetBox branch {branch_name!r} was not found or has no schema_id")
+    _NETBOX_BRANCH_HEADER_VALUE = branch["schema_id"]
+    log_event("netbox_branch_resolved", branch_name=branch_name, branch_id=branch.get("id"), branch_schema_id=_NETBOX_BRANCH_HEADER_VALUE)
+    return _NETBOX_BRANCH_HEADER_VALUE
+
+
+def netbox_request(method, path, payload=None, token=None, use_branch=True):
     started = time.monotonic()
     base_url = os.getenv("NETBOX_URL", "http://netbox.netbox.svc.cluster.local").rstrip("/")
     token = token or os.getenv("NETBOX_TOKEN")
@@ -321,9 +345,10 @@ def netbox_request(method, path, payload=None, token=None):
         return None
     data = None if payload is None else json.dumps(payload).encode()
     headers = {"Accept": "application/json", "Authorization": netbox_auth_header(token)}
-    branch_name = os.getenv("NETBOX_BRANCH_NAME", "diode").strip()
-    if branch_name:
-        headers["X-NetBox-Branch"] = branch_name
+    if use_branch:
+        branch_header_value = netbox_branch_header_value(token)
+        if branch_header_value:
+            headers[NETBOX_BRANCH_HEADER] = branch_header_value
     if payload is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"{base_url}{path}", data=data, method=method, headers=headers)
