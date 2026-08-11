@@ -660,14 +660,54 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
             entities.append(Entity(mac_address=mac_obj))
         entities.append(Entity(device=device_obj))
 
-    entities.extend(build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx))
+    existing_cabled_interfaces = existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx)
+    entities.extend(build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces))
     entities.extend(build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx))
     return entities
 
 
-def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx):
+def netbox_interface_key(device_name, interface_name):
+    return (str(device_name), str(interface_name))
+
+
+def netbox_interface_is_cabled(device_name, interface_name):
+    query = urllib.parse.urlencode({"device": device_name, "name": interface_name, "limit": 1})
+    result = netbox_request("GET", f"/api/dcim/interfaces/?{query}")
+    return bool(result and result.get("results") and result["results"][0].get("cable"))
+
+
+def existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx):
+    if not os.getenv("NETBOX_TOKEN"):
+        return set()
+    checked = {}
+    for device in devices:
+        local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
+        uplink = device.get("uplink") or {}
+        remote_mac = normalize_mac(uplink.get("uplink_mac"))
+        local_port_idx = uplink.get("port_idx")
+        remote_port_idx = uplink.get("uplink_remote_port")
+        if not local_mac or not remote_mac or local_port_idx is None or remote_port_idx is None:
+            continue
+        for mac, port_idx in [(local_mac, local_port_idx), (remote_mac, remote_port_idx)]:
+            device_obj = device_by_mac.get(mac)
+            iface = port_by_device_mac_and_idx.get((mac, port_idx))
+            if not device_obj or not iface:
+                continue
+            key = netbox_interface_key(device_obj.name, iface.name)
+            if key in checked:
+                continue
+            try:
+                checked[key] = netbox_interface_is_cabled(*key)
+            except Exception as exc:
+                checked[key] = False
+                print(f"NetBox interface cable precheck failed device={device_obj.name!r} interface={iface.name!r} error={exc}")
+    return {key for key, is_cabled in checked.items() if is_cabled}
+
+
+def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces=None):
     entities = []
     seen = set()
+    existing_cabled_interfaces = existing_cabled_interfaces or set()
     for device in devices:
         local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
         for uplink in [device.get("uplink") or {}]:
@@ -686,6 +726,11 @@ def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx):
             seen.add(endpoint_key)
             local_device = device_by_mac.get(local_mac)
             remote_device = device_by_mac.get(remote_mac)
+            local_key = netbox_interface_key(local_device.name if local_device else local_mac, local_iface.name)
+            remote_key = netbox_interface_key(remote_device.name if remote_device else remote_mac, remote_iface.name)
+            if local_key in existing_cabled_interfaces or remote_key in existing_cabled_interfaces:
+                print(f"skipping existing cabled link local={local_key!r} remote={remote_key!r}")
+                continue
             label = f"UniFi LLDP {local_device.name if local_device else local_mac} {local_iface.name} to {remote_device.name if remote_device else remote_mac} {remote_iface.name}"
             cable = Cable(
                 type="cat6" if interface_type_for(uplink).endswith("base-t") else "dac-active",

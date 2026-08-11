@@ -1,11 +1,14 @@
 from netbox_diode_unifi.discover import (
+    build_cable_entities,
     build_device_entities,
     ensure_device_types,
     ip_with_mask,
+    netbox_interface_key,
     netbox_auth_header,
     normalize_mac,
     slugify,
 )
+from netboxlabs.diode.sdk.ingester import Device, Interface, Manufacturer
 
 
 def entity_fields(entity):
@@ -44,6 +47,38 @@ def test_ensure_device_types_uses_netbox_manufacturer_slug(monkeypatch):
     assert calls == [
         ("GET", "/api/dcim/device-types/?manufacturer=ubiquiti&model=UDMPRO&limit=1", None, "nbt_example.secret")
     ]
+
+
+def test_build_cable_entities_skips_existing_cabled_endpoint():
+    manufacturer = Manufacturer(name="Ubiquiti", slug="ubiquiti")
+    local_device = Device(name="USW-24-PoE", device_type="USL24PB", manufacturer=manufacturer)
+    remote_device = Device(name="USW Pro Aggregation", device_type="USAGGPRO", manufacturer=manufacturer)
+    local_iface = Interface(device=local_device, name="SFP 1", type="1000base-x-sfp")
+    remote_iface = Interface(device=remote_device, name="SFP+ 1", type="10gbase-x-sfpp")
+
+    entities = build_cable_entities(
+        devices=[
+            {
+                "mac": "aa:bb:cc:dd:ee:ff",
+                "uplink": {
+                    "port_idx": 1,
+                    "uplink_mac": "11:22:33:44:55:66",
+                    "uplink_remote_port": 1,
+                },
+            }
+        ],
+        device_by_mac={
+            "aa:bb:cc:dd:ee:ff": local_device,
+            "11:22:33:44:55:66": remote_device,
+        },
+        port_by_device_mac_and_idx={
+            ("aa:bb:cc:dd:ee:ff", 1): local_iface,
+            ("11:22:33:44:55:66", 1): remote_iface,
+        },
+        existing_cabled_interfaces={netbox_interface_key("USW-24-PoE", "SFP 1")},
+    )
+
+    assert entities == []
 
 
 def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
