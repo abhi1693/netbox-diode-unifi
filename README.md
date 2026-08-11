@@ -28,6 +28,10 @@ Optional environment variables:
 - `UNIFI_SECRET_KEY`, default `api-key`
 - `UNIFI_IMPORT_DEVICE_TYPES`, default `true`
 - `UNIFI_INCLUDE_CLIENT_DEVICES`, default `false`
+- `UNIFI_PRUNE_STALE`, default `true`; remove supported discovery-owned NetBox
+  objects that are absent from the current UniFi payload
+- `UNIFI_PRUNE_MAX_DELETE`, default `100`; refuse a run before deletion when
+  the complete stale-object plan exceeds this safety limit
 - `UNIFI_VPN_ENDPOINTS`, optional comma-separated UniFi VPN endpoint templates.
   Templates may use `{site}` and default to the known legacy/v2 VPN collection
   paths. Missing endpoints are skipped because UniFi exposes VPN data
@@ -50,6 +54,14 @@ accurate enough to model client interfaces and their assigned addresses.
 Infrastructure device MAC addresses are assigned to and selected as the primary
 MAC of each device's virtual `mgmt` interface so repeated Diode runs reconcile
 the same NetBox object.
+
+After a successful Diode ingestion, the collector compares the desired payload
+with the `diode` branch and removes stale objects only when they carry both the
+`diode-discovery` and `unifi` tags. The prune phase currently covers VPN
+tunnels, WLANs, IP ranges, IP addresses, prefixes, MAC addresses, and VLANs.
+It refuses to run when discovery emits no devices or when the deletion plan
+exceeds `UNIFI_PRUNE_MAX_DELETE`. Devices, interfaces, circuits, and cables are
+not pruned until their dependency-aware deletion paths are implemented.
 
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.

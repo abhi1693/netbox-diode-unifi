@@ -38,7 +38,7 @@ from netboxlabs.diode.sdk.ingester import (
 
 
 APP_NAME = "home-lab-unifi-discovery"
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.0"
 TAGS = ["diode-discovery", "unifi"]
 UBIQUITI = Manufacturer(name="Ubiquiti", slug="ubiquiti")
 UNKNOWN = Manufacturer(name="Unknown", slug="unknown")
@@ -109,6 +109,157 @@ def entity_type_counts(entities):
         name = fields[-1][0].name
         counts[name] = counts.get(name, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def discovery_owned(record):
+    tags = {
+        str(tag.get("slug") or tag.get("name") or "").lower()
+        for tag in record.get("tags") or []
+        if isinstance(tag, dict)
+    }
+    return set(TAGS).issubset(tags)
+
+
+def prune_key(resource, value):
+    if resource == "tunnels":
+        return str(value.get("name") or "")
+    if resource == "wireless_lans":
+        return str(value.get("ssid") or "")
+    if resource == "ip_ranges":
+        endpoints = []
+        for field in ("start_address", "end_address"):
+            raw = str(value.get(field) or "")
+            try:
+                endpoints.append(str(ipaddress.ip_interface(raw).ip))
+            except ValueError:
+                endpoints.append(raw)
+        return tuple(endpoints)
+    if resource == "ip_addresses":
+        return str(value.get("address") or "")
+    if resource == "prefixes":
+        return str(value.get("prefix") or "")
+    if resource == "mac_addresses":
+        return str(value.get("mac_address") or "").lower()
+    if resource == "vlans":
+        site_value = value.get("site") or {}
+        site_slug = site_value.get("slug") if isinstance(site_value, dict) else ""
+        return site_slug or "", int(value.get("vid") or 0)
+    raise ValueError(f"unsupported prune resource {resource}")
+
+
+def desired_prune_keys(entities):
+    desired = {
+        "tunnels": set(),
+        "wireless_lans": set(),
+        "ip_ranges": set(),
+        "ip_addresses": set(),
+        "prefixes": set(),
+        "mac_addresses": set(),
+        "vlans": set(),
+    }
+    for entity in entities:
+        if entity.HasField("tunnel"):
+            desired["tunnels"].add(prune_key("tunnels", {"name": entity.tunnel.name}))
+        elif entity.HasField("wireless_lan"):
+            desired["wireless_lans"].add(prune_key("wireless_lans", {"ssid": entity.wireless_lan.ssid}))
+        elif entity.HasField("ip_range"):
+            desired["ip_ranges"].add(
+                prune_key(
+                    "ip_ranges",
+                    {
+                        "start_address": entity.ip_range.start_address,
+                        "end_address": entity.ip_range.end_address,
+                    },
+                )
+            )
+        elif entity.HasField("ip_address"):
+            desired["ip_addresses"].add(prune_key("ip_addresses", {"address": entity.ip_address.address}))
+        elif entity.HasField("prefix"):
+            desired["prefixes"].add(prune_key("prefixes", {"prefix": entity.prefix.prefix}))
+        elif entity.HasField("mac_address"):
+            desired["mac_addresses"].add(prune_key("mac_addresses", {"mac_address": entity.mac_address.mac_address}))
+        elif entity.HasField("vlan"):
+            desired["vlans"].add(
+                prune_key(
+                    "vlans",
+                    {
+                        "site": {"slug": entity.vlan.site.slug},
+                        "vid": entity.vlan.vid,
+                    },
+                )
+            )
+    return desired
+
+
+PRUNE_RESOURCE_PATHS = {
+    "tunnels": "/api/vpn/tunnels/",
+    "wireless_lans": "/api/wireless/wireless-lans/",
+    "ip_ranges": "/api/ipam/ip-ranges/",
+    "ip_addresses": "/api/ipam/ip-addresses/",
+    "prefixes": "/api/ipam/prefixes/",
+    "mac_addresses": "/api/dcim/mac-addresses/",
+    "vlans": "/api/ipam/vlans/",
+}
+
+
+def prune_stale_discovery_entities(entities):
+    if not bool_env("UNIFI_PRUNE_STALE", True):
+        log_event("stale_entity_prune_skipped", reason="disabled")
+        return {"planned": 0, "deleted": 0, "by_resource": {}}
+    if not os.getenv("NETBOX_TOKEN"):
+        log_event("stale_entity_prune_skipped", reason="missing_netbox_token")
+        return {"planned": 0, "deleted": 0, "by_resource": {}}
+    if not any(entity.HasField("device") for entity in entities):
+        raise RuntimeError("refusing stale entity prune because discovery emitted no devices")
+
+    started = time.monotonic()
+    desired = desired_prune_keys(entities)
+    plan = []
+    live_by_resource = {}
+    for resource, path in PRUNE_RESOURCE_PATHS.items():
+        separator = "&" if "?" in path else "?"
+        response = netbox_request("GET", f"{path}{separator}limit=1000") or {}
+        records = response.get("results") or []
+        live_by_resource[resource] = records
+        for record in records:
+            if discovery_owned(record) and prune_key(resource, record) not in desired[resource]:
+                plan.append(
+                    {
+                        "resource": resource,
+                        "path": path,
+                        "id": record["id"],
+                        "display": record.get("display") or record.get("name") or record.get("address") or record.get("prefix") or record.get("mac_address") or str(record["id"]),
+                    }
+                )
+
+    max_delete = int(os.getenv("UNIFI_PRUNE_MAX_DELETE", "100"))
+    if len(plan) > max_delete:
+        raise RuntimeError(f"refusing stale entity prune of {len(plan)} objects; limit is {max_delete}")
+
+    by_resource = {}
+    for item in plan:
+        by_resource[item["resource"]] = by_resource.get(item["resource"], 0) + 1
+    log_event(
+        "stale_entity_prune_planned",
+        planned=len(plan),
+        by_resource=by_resource,
+        objects=[{"resource": item["resource"], "id": item["id"], "display": item["display"]} for item in plan],
+    )
+
+    deleted = 0
+    for item in plan:
+        netbox_request("DELETE", f"{item['path']}{item['id']}/")
+        deleted += 1
+        log_event("stale_entity_deleted", resource=item["resource"], object_id=item["id"], display=item["display"])
+
+    log_event(
+        "stale_entity_prune_finished",
+        planned=len(plan),
+        deleted=deleted,
+        by_resource=by_resource,
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
+    return {"planned": len(plan), "deleted": deleted, "by_resource": by_resource}
 
 
 def site():
@@ -1922,6 +2073,7 @@ def main():
             response_type=response.__class__.__name__,
             response=repr(response)[:500],
         )
+        prune_result = prune_stale_discovery_entities(entities)
         log_event(
             "run_succeeded",
             elapsed_ms=round((time.monotonic() - started) * 1000),
@@ -1932,6 +2084,7 @@ def main():
             entities=counts["entities"],
             entity_types=counts["entity_types"],
             device_type_import=counts["device_type_import"],
+            stale_entity_prune=prune_result,
         )
     except Exception as exc:
         log_exception("run_failed", exc, elapsed_ms=round((time.monotonic() - started) * 1000))

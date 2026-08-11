@@ -13,12 +13,15 @@ from netbox_diode_unifi.discover import (
     netbox_interface_is_cabled,
     netbox_auth_header,
     normalize_mac,
+    prune_key,
+    prune_stale_discovery_entities,
     slugify,
     unifi_device_type_library_name,
     unifi_device_type_model,
 )
 import json
-from netboxlabs.diode.sdk.ingester import Device, Interface, Manufacturer
+import pytest
+from netboxlabs.diode.sdk.ingester import Device, Entity, Interface, Manufacturer, Prefix, Tunnel
 
 
 def entity_fields(entity):
@@ -591,6 +594,60 @@ def test_build_vpn_entities_skips_when_unifi_has_no_vpn_configs(capsys):
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert logs[-1]["event"] == "vpn_entities_skipped"
     assert logs[-1]["reason"] == "no_vpn_configs"
+
+
+def test_prune_stale_discovery_entities_deletes_only_owned_absent_objects(monkeypatch):
+    monkeypatch.setenv("NETBOX_TOKEN", "token")
+    responses = {
+        "/api/vpn/tunnels/?limit=1000": {
+            "results": [
+                {"id": 1, "name": "NNJ2", "tags": [{"slug": "diode-discovery"}, {"slug": "unifi"}]},
+                {"id": 2, "name": "OpenVPN Server", "tags": [{"slug": "diode-discovery"}, {"slug": "unifi"}]},
+                {"id": 3, "name": "Manual Tunnel", "tags": []},
+            ]
+        },
+        "/api/ipam/prefixes/?limit=1000": {
+            "results": [
+                {"id": 10, "prefix": "192.168.1.0/24", "tags": [{"slug": "diode-discovery"}, {"slug": "unifi"}]},
+                {"id": 11, "prefix": "192.168.5.0/24", "tags": [{"slug": "diode-discovery"}, {"slug": "unifi"}]},
+            ]
+        },
+    }
+    deleted_paths = []
+
+    def fake_netbox_request(method, path, payload=None, token=None, use_branch=True):
+        if method == "GET":
+            return responses.get(path, {"results": []})
+        if method == "DELETE":
+            deleted_paths.append(path)
+            return {}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+    entities = [
+        Entity(device=Device(name="UDM-Pro")),
+        Entity(tunnel=Tunnel(name="NNJ2")),
+        Entity(prefix=Prefix(prefix="192.168.1.0/24")),
+    ]
+
+    result = prune_stale_discovery_entities(entities)
+
+    assert result == {"planned": 2, "deleted": 2, "by_resource": {"tunnels": 1, "prefixes": 1}}
+    assert deleted_paths == ["/api/vpn/tunnels/2/", "/api/ipam/prefixes/11/"]
+
+
+def test_prune_stale_discovery_entities_refuses_empty_device_inventory(monkeypatch):
+    monkeypatch.setenv("NETBOX_TOKEN", "token")
+
+    with pytest.raises(RuntimeError, match="discovery emitted no devices"):
+        prune_stale_discovery_entities([Entity(tunnel=Tunnel(name="NNJ2"))])
+
+
+def test_prune_key_normalizes_netbox_ip_range_masks():
+    assert prune_key(
+        "ip_ranges",
+        {"start_address": "192.168.1.6/32", "end_address": "192.168.1.254/32"},
+    ) == ("192.168.1.6", "192.168.1.254")
 
 
 def test_build_device_entities_adds_wan_circuit_cable():
