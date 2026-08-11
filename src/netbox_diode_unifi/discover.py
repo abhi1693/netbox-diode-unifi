@@ -153,7 +153,7 @@ def ensure_device_types(devices):
     models = sorted({clean_name(device.get("model")) for device in devices if device.get("model")})
     result = {"checked": len(models), "imported": 0, "missing": 0, "failed": 0}
     for model in models:
-        query = urllib.parse.urlencode({"manufacturer": UBIQUITI.name, "model": model, "limit": 1})
+        query = urllib.parse.urlencode({"manufacturer": UBIQUITI.slug, "model": model, "limit": 1})
         try:
             existing = netbox_request("GET", f"/api/dcim/device-types/?{query}", token=token)
             if existing and existing.get("count", 0) > 0:

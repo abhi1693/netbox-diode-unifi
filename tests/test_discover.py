@@ -1,5 +1,6 @@
 from netbox_diode_unifi.discover import (
     build_device_entities,
+    ensure_device_types,
     ip_with_mask,
     netbox_auth_header,
     normalize_mac,
@@ -22,6 +23,27 @@ def test_netbox_auth_header_preserves_modern_and_legacy_tokens():
     assert netbox_auth_header("nbt_example.secret") == "Bearer nbt_example.secret"
     assert netbox_auth_header("Token abc123") == "Token abc123"
     assert netbox_auth_header("abc123") == "Token abc123"
+
+
+def test_ensure_device_types_uses_netbox_manufacturer_slug(monkeypatch):
+    calls = []
+
+    def fake_netbox_request(method, path, payload=None, token=None):
+        calls.append((method, path, payload, token))
+        return {"count": 1}
+
+    monkeypatch.setenv("NETBOX_TOKEN", "nbt_example.secret")
+    monkeypatch.setattr("netbox_diode_unifi.discover.netbox_request", fake_netbox_request)
+
+    assert ensure_device_types([{"model": "UDMPRO"}]) == {
+        "checked": 1,
+        "imported": 0,
+        "missing": 0,
+        "failed": 0,
+    }
+    assert calls == [
+        ("GET", "/api/dcim/device-types/?manufacturer=ubiquiti&model=UDMPRO&limit=1", None, "nbt_example.secret")
+    ]
 
 
 def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
