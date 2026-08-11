@@ -335,6 +335,10 @@ def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
     assert mac_entity.mac_address.assigned_object_interface.name == "mgmt"
     assert mac_entity.mac_address.assigned_object_interface.device.name == "AP Test"
     assert mac_entity.mac_address.assigned_object_interface.parent.name == "eth0"
+    mgmt_entity = next(
+        entity for entity in entities if "interface" in entity_fields(entity) and entity.interface.name == "mgmt"
+    )
+    assert mgmt_entity.interface.primary_mac_address.mac_address == "aa:bb:cc:dd:ee:ff"
 
 
 def test_build_device_entities_uses_mapped_device_type_model():
@@ -764,6 +768,10 @@ def test_build_device_entities_prefers_device_mac_over_duplicate_client_mac(caps
     assert mac_entities[0].mac_address.description == "UniFi device MAC for Switch Test"
     assert mac_entities[0].mac_address.assigned_object_interface.name == "mgmt"
     assert mac_entities[0].mac_address.assigned_object_interface.device.name == "Switch Test"
+    mgmt_entity = next(
+        entity for entity in entities if "interface" in entity_fields(entity) and entity.interface.name == "mgmt"
+    )
+    assert mgmt_entity.interface.primary_mac_address.mac_address == "aa:bb:cc:dd:ee:ff"
 
     logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     skipped_log = next(log for log in logs if log["event"] == "client_entities_skipped")

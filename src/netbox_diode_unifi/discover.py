@@ -1531,6 +1531,8 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 selected_from_default_network=ip_selection_reason == "default_network",
             )
         mgmt = None
+        mgmt_ip = None
+        mac_obj = None
         if ip_address or device_mac:
             mgmt = Interface(
                 device=device_obj,
@@ -1543,7 +1545,6 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 tags=TAGS,
                 metadata={"source": APP_NAME, "parent_discovered": bool(parent)},
             )
-            entities.append(Entity(interface=mgmt))
 
         if ip_address:
             seen_ips.add(ip_address)
@@ -1564,21 +1565,26 @@ def build_device_entities(devices, networks, clients=None, wlans=None, vpn_confi
                 device_obj.primary_ip4.CopyFrom(mgmt_ip)
             else:
                 device_obj.primary_ip6.CopyFrom(mgmt_ip)
-            entities.append(Entity(ip_address=mgmt_ip))
 
         if device_mac:
-            mac_obj = MACAddress(
-                mac_address=device_mac,
-                assigned_object_interface=mgmt,
-                description=f"UniFi device MAC for {device_obj.name}",
-                tags=TAGS,
-                metadata={"source": APP_NAME, "device_serial": device_serial(device)},
-            )
             if device_mac not in seen_macs:
                 seen_macs.add(device_mac)
-                entities.append(Entity(mac_address=mac_obj))
+                mac_obj = MACAddress(
+                    mac_address=device_mac,
+                    assigned_object_interface=mgmt,
+                    description=f"UniFi device MAC for {device_obj.name}",
+                    tags=TAGS,
+                    metadata={"source": APP_NAME, "device_serial": device_serial(device)},
+                )
+                mgmt.primary_mac_address.CopyFrom(mac_obj)
             else:
                 log_event("mac_address_skipped", reason="duplicate", mac=device_mac, owner=device_obj.name, owner_type="device")
+        if mgmt:
+            entities.append(Entity(interface=mgmt))
+        if mgmt_ip:
+            entities.append(Entity(ip_address=mgmt_ip))
+        if mac_obj:
+            entities.append(Entity(mac_address=mac_obj))
         entities.append(Entity(device=device_obj))
 
     existing_cabled_interfaces = existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx)

@@ -47,8 +47,9 @@ records are emitted while client modeling is disabled. Set
 `UNIFI_INCLUDE_CLIENT_DEVICES=true` only after infrastructure devices are
 accurate enough to model client interfaces and their assigned addresses.
 
-Infrastructure device MAC addresses are assigned to each device's virtual
-`mgmt` interface so repeated Diode runs reconcile the same NetBox object.
+Infrastructure device MAC addresses are assigned to and selected as the primary
+MAC of each device's virtual `mgmt` interface so repeated Diode runs reconcile
+the same NetBox object.
 
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.
