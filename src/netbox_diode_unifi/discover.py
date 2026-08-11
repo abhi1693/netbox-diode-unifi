@@ -128,13 +128,22 @@ def netbox_request(method, path, payload=None, token=None):
     if not token:
         return None
     data = None if payload is None else json.dumps(payload).encode()
-    headers = {"Accept": "application/json", "Authorization": f"Token {token}"}
+    headers = {"Accept": "application/json", "Authorization": netbox_auth_header(token)}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(f"{base_url}{path}", data=data, method=method, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read()
         return json.loads(body) if body else {}
+
+
+def netbox_auth_header(token):
+    token = str(token).strip()
+    if token.startswith(("Bearer ", "Token ")):
+        return token
+    if token.startswith("nbt_"):
+        return f"Bearer {token}"
+    return f"Token {token}"
 
 
 def ensure_device_types(devices):

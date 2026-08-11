@@ -1,4 +1,10 @@
-from netbox_diode_unifi.discover import build_device_entities, ip_with_mask, normalize_mac, slugify
+from netbox_diode_unifi.discover import (
+    build_device_entities,
+    ip_with_mask,
+    netbox_auth_header,
+    normalize_mac,
+    slugify,
+)
 
 
 def entity_fields(entity):
@@ -9,6 +15,13 @@ def test_helpers_normalize_values():
     assert slugify("UniFi Dream Machine") == "unifi-dream-machine"
     assert normalize_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff"
     assert ip_with_mask("192.168.1.10") == "192.168.1.10/32"
+
+
+def test_netbox_auth_header_preserves_modern_and_legacy_tokens():
+    assert netbox_auth_header("Bearer nbt_example.secret") == "Bearer nbt_example.secret"
+    assert netbox_auth_header("nbt_example.secret") == "Bearer nbt_example.secret"
+    assert netbox_auth_header("Token abc123") == "Token abc123"
+    assert netbox_auth_header("abc123") == "Token abc123"
 
 
 def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
