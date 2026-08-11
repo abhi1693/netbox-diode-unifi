@@ -8,8 +8,8 @@ NetBox entities to Diode for reconciliation into NetBox.
 
 ## Runtime
 
-The Kubernetes deployment in `home-lab` runs this package from an immutable
-GitHub archive URL and provides configuration through environment variables.
+The Kubernetes deployment in `home-lab` runs the published container image and
+provides configuration through environment variables.
 
 Required environment variables:
 
@@ -65,6 +65,20 @@ not pruned until their dependency-aware deletion paths are implemented.
 
 No environment-specific aliases are built into the collector. UniFi names and
 models are emitted as discovered.
+
+## Container Image
+
+The production image is built from `Dockerfile` and published by
+`.github/workflows/container.yml` through the shared
+`abhi1693/actions/.github/workflows/docker-build-push.yml@master` workflow.
+Pushes to `master` publish a linux/arm64 image as:
+
+```text
+ghcr.io/abhi1693/netbox-diode-unifi:<full-commit-sha>
+```
+
+The image runs as UID/GID `1000` and starts the collector through the
+`netbox-diode-unifi` console script.
 
 VPN data is collected from the official VPN server and site-to-site endpoints
 and enriched with detailed VPN network configuration records from

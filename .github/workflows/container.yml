@@ -1,0 +1,40 @@
+---
+name: Container Image
+
+on:
+  push:
+    branches:
+      - master
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver image version without a leading v
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build linux/arm64
+    uses: abhi1693/actions/.github/workflows/docker-build-push.yml@master
+    with:
+      runs-on: ubuntu-24.04-arm
+      image: ghcr.io/abhi1693/netbox-diode-unifi
+      context: .
+      file: Dockerfile
+      platforms: linux/arm64
+      cache-scope: netbox-diode-unifi-arm64
+      tags: |
+        type=semver,pattern={{version}}
+        type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
+        type=raw,value=${{ github.sha }}
+      labels: |
+        org.opencontainers.image.source=https://github.com/abhi1693/netbox-diode-unifi
+        org.opencontainers.image.title=netbox-diode-unifi
+    secrets:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
