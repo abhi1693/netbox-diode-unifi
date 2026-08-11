@@ -121,6 +121,86 @@ def ip_with_mask(value):
     return f"{ip}/32" if ip.version == 4 else f"{ip}/128"
 
 
+def ip_address_value(value):
+    if not value:
+        return None
+    try:
+        return ipaddress.ip_address(str(value))
+    except ValueError:
+        return None
+
+
+def network_prefix_value(network):
+    prefix = network.get("ip_subnet")
+    if not prefix and network.get("wan_ip") and network.get("wan_netmask"):
+        try:
+            prefix = str(ipaddress.ip_network(f"{network['wan_ip']}/{network['wan_netmask']}", strict=False))
+        except ValueError:
+            prefix = None
+    if not prefix:
+        return None
+    try:
+        return ipaddress.ip_network(prefix, strict=False)
+    except ValueError:
+        return None
+
+
+def is_default_network(network):
+    return bool(network.get("default")) or network.get("name") == "Default"
+
+
+def management_network_prefixes(networks):
+    prefixes = []
+    seen = set()
+    for network in networks:
+        if not is_default_network(network):
+            continue
+        prefix = network_prefix_value(network)
+        if prefix is None:
+            continue
+        key = str(prefix)
+        if key not in seen:
+            seen.add(key)
+            prefixes.append(prefix)
+    return prefixes
+
+
+def device_ip_candidates(device):
+    candidates = []
+    seen = set()
+
+    def add(value):
+        ip = ip_address_value(value)
+        if ip is None:
+            return
+        key = str(ip)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(ip)
+
+    for key in ("ip", "ipAddress", "display_ip", "connect_request_ip"):
+        add(device.get(key))
+
+    uplink = device.get("uplink")
+    if isinstance(uplink, dict):
+        for key in ("ip", "ipAddress", "ip_addr"):
+            add(uplink.get(key))
+
+    return candidates
+
+
+def select_management_ip(device, management_prefixes):
+    candidates = device_ip_candidates(device)
+    for candidate in candidates:
+        if any(candidate.version == prefix.version and candidate in prefix for prefix in management_prefixes):
+            return ip_with_mask(candidate), str(candidate), "default_network", len(candidates)
+    if candidates:
+        candidate = candidates[0]
+        return ip_with_mask(candidate), str(candidate), "first_valid", len(candidates)
+    return None, None, "none", 0
+
+
 def compact_json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -351,24 +431,16 @@ def network_vid(network):
                 return int(value)
             except (TypeError, ValueError):
                 return None
-    if network.get("default") or network.get("name") == "Default":
+    if is_default_network(network):
         return 1
     return None
 
 
 def prefix_for_network(network, home_site=None):
-    prefix = network.get("ip_subnet")
-    if not prefix and network.get("wan_ip") and network.get("wan_netmask"):
-        try:
-            prefix = str(ipaddress.ip_network(f"{network['wan_ip']}/{network['wan_netmask']}", strict=False))
-        except ValueError:
-            prefix = None
-    if not prefix:
+    prefix = network_prefix_value(network)
+    if prefix is None:
         return None
-    try:
-        normalized = str(ipaddress.ip_network(prefix, strict=False))
-    except ValueError:
-        return None
+    normalized = str(prefix)
     safe_keys = [
         "_id",
         "external_id",
@@ -674,6 +746,12 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
     home_site = site()
     clients = clients or []
     wlans = wlans or []
+    mgmt_prefixes = management_network_prefixes(networks)
+    log_event(
+        "management_network_detected",
+        prefixes=[str(prefix) for prefix in mgmt_prefixes],
+        source="unifi_default_network",
+    )
     entities = [Entity(site=home_site)]
     vlan_entities, vlan_by_id = build_vlan_entities(networks, home_site)
     entities.extend(vlan_entities)
@@ -749,7 +827,17 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
             )
             entities.append(Entity(interface=parent))
 
-        ip_address = ip_with_mask(device.get("ip") or device.get("ipAddress"))
+        ip_address, selected_ip, ip_selection_reason, candidate_count = select_management_ip(device, mgmt_prefixes)
+        if candidate_count:
+            log_event(
+                "device_management_ip_selected",
+                device=device_obj.name,
+                selected_ip=selected_ip,
+                reason=ip_selection_reason,
+                candidate_count=candidate_count,
+                default_network_prefixes=[str(prefix) for prefix in mgmt_prefixes],
+                selected_from_default_network=ip_selection_reason == "default_network",
+            )
         if ip_address:
             seen_ips.add(ip_address)
             mgmt = Interface(
@@ -769,8 +857,17 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 assigned_object_interface=mgmt,
                 description=f"UniFi management IP for {device_obj.name}",
                 tags=TAGS,
-                metadata={"source": APP_NAME, "device_mac": device_mac},
+                metadata={
+                    "source": APP_NAME,
+                    "device_mac": device_mac,
+                    "management_ip_selection": ip_selection_reason,
+                    "management_network_prefixes": [str(prefix) for prefix in mgmt_prefixes],
+                },
             )
+            if ipaddress.ip_interface(ip_address).ip.version == 4:
+                device_obj.primary_ip4.CopyFrom(mgmt_ip)
+            else:
+                device_obj.primary_ip6.CopyFrom(mgmt_ip)
             entities.append(Entity(interface=mgmt))
             entities.append(Entity(ip_address=mgmt_ip))
 

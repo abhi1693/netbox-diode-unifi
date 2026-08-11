@@ -181,3 +181,69 @@ def test_build_device_entities_assigns_mgmt_interface_to_physical_parent():
     assert ip_entity.ip_address.assigned_object_interface.name == "mgmt"
     assert ip_entity.ip_address.assigned_object_interface.device.name == "AP Test"
     assert ip_entity.ip_address.assigned_object_interface.parent.name == "eth0"
+
+
+def test_build_device_entities_prefers_default_network_ip_for_primary_ip(capsys):
+    entities = build_device_entities(
+        devices=[
+            {
+                "_id": "dev1",
+                "name": "Switch Test",
+                "model": "USW-Test",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "10.10.10.20",
+                "ipAddress": "192.168.1.10",
+                "state": 1,
+                "type": "usw",
+            }
+        ],
+        clients=[],
+        networks=[
+            {
+                "_id": "network1",
+                "name": "Default",
+                "default": True,
+                "ip_subnet": "192.168.1.0/24",
+            }
+        ],
+        wlans=[],
+    )
+
+    ip_entity = next(entity for entity in entities if "ip_address" in entity_fields(entity))
+    device_entity = next(entity for entity in entities if "device" in entity_fields(entity))
+
+    assert ip_entity.ip_address.address == "192.168.1.10/32"
+    assert device_entity.device.primary_ip4.address == "192.168.1.10/32"
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    selection_log = next(log for log in logs if log["event"] == "device_management_ip_selected")
+    assert selection_log["reason"] == "default_network"
+    assert selection_log["selected_ip"] == "192.168.1.10"
+    assert selection_log["selected_from_default_network"] is True
+
+
+def test_build_device_entities_falls_back_to_first_valid_ip_without_default_network(capsys):
+    entities = build_device_entities(
+        devices=[
+            {
+                "_id": "dev1",
+                "name": "Switch Test",
+                "model": "USW-Test",
+                "mac": "AA:BB:CC:DD:EE:FF",
+                "ip": "10.10.10.20",
+                "ipAddress": "192.168.1.10",
+                "state": 1,
+                "type": "usw",
+            }
+        ],
+        clients=[],
+        networks=[],
+        wlans=[],
+    )
+
+    ip_entity = next(entity for entity in entities if "ip_address" in entity_fields(entity))
+    assert ip_entity.ip_address.address == "10.10.10.20/32"
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    selection_log = next(log for log in logs if log["event"] == "device_management_ip_selected")
+    assert selection_log["reason"] == "first_valid"
