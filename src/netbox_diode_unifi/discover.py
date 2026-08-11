@@ -9,15 +9,22 @@ import urllib.request
 
 from netboxlabs.diode.sdk import DiodeClient
 from netboxlabs.diode.sdk.ingester import (
+    Cable,
+    Circuit,
+    CircuitTermination,
+    CircuitType,
     Device,
     DeviceRole,
     DeviceType,
     Entity,
+    GenericObject,
     IPAddress,
     Interface,
     MACAddress,
     Manufacturer,
     Platform,
+    Prefix,
+    Provider,
     Site,
     VLAN,
     WirelessLAN,
@@ -77,6 +84,13 @@ def filtered_metadata(data, keys):
     return {key: data.get(key) for key in keys if data.get(key) is not None}
 
 
+def bool_env(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def read_kubernetes_secret_key(namespace, name, key):
     token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
     ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -106,6 +120,45 @@ def unifi_get(api_key, path, params=None):
     ctx = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
     with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
         return json.loads(resp.read())
+
+
+def netbox_request(method, path, payload=None, token=None):
+    base_url = os.getenv("NETBOX_URL", "http://netbox.netbox.svc.cluster.local").rstrip("/")
+    token = token or os.getenv("NETBOX_TOKEN")
+    if not token:
+        return None
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {"Accept": "application/json", "Authorization": f"Token {token}"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{base_url}{path}", data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read()
+        return json.loads(body) if body else {}
+
+
+def ensure_device_types(devices):
+    token = os.getenv("NETBOX_TOKEN")
+    if not token or not bool_env("UNIFI_IMPORT_DEVICE_TYPES", True):
+        return {"checked": 0, "imported": 0, "missing": 0, "failed": 0}
+    models = sorted({clean_name(device.get("model")) for device in devices if device.get("model")})
+    result = {"checked": len(models), "imported": 0, "missing": 0, "failed": 0}
+    for model in models:
+        query = urllib.parse.urlencode({"manufacturer": UBIQUITI.name, "model": model, "limit": 1})
+        try:
+            existing = netbox_request("GET", f"/api/dcim/device-types/?{query}", token=token)
+            if existing and existing.get("count", 0) > 0:
+                continue
+            response = netbox_request("POST", "/api/plugins/meta-types/device-type-import/", {"name": model}, token=token)
+            if response and "Imported:" in response.get("message", ""):
+                result["imported"] += 1
+            else:
+                result["missing"] += 1
+                print(f"device type importer did not import model={model!r} response={response!r}")
+        except Exception as exc:
+            result["failed"] += 1
+            print(f"device type importer failed model={model!r} error={exc}")
+    return result
 
 
 def paged(api_key, path):
@@ -153,6 +206,11 @@ def platform_for_device(device):
 
 
 def network_vid(network):
+    if network.get("wan_vlan_enabled") and network.get("wan_vlan") is not None:
+        try:
+            return int(network.get("wan_vlan"))
+        except (TypeError, ValueError):
+            return None
     for key in ("vlanId", "vlan"):
         value = network.get(key)
         if value is not None:
@@ -163,6 +221,50 @@ def network_vid(network):
     if network.get("default") or network.get("name") == "Default":
         return 1
     return None
+
+
+def prefix_for_network(network, home_site=None):
+    prefix = network.get("ip_subnet")
+    if not prefix and network.get("wan_ip") and network.get("wan_netmask"):
+        try:
+            prefix = str(ipaddress.ip_network(f"{network['wan_ip']}/{network['wan_netmask']}", strict=False))
+        except ValueError:
+            prefix = None
+    if not prefix:
+        return None
+    try:
+        normalized = str(ipaddress.ip_network(prefix, strict=False))
+    except ValueError:
+        return None
+    safe_keys = [
+        "_id",
+        "external_id",
+        "purpose",
+        "networkgroup",
+        "wan_networkgroup",
+        "gateway_type",
+        "wan_type",
+        "wan_vlan",
+        "vlan",
+        "dhcpd_enabled",
+        "dhcpd_start",
+        "dhcpd_stop",
+        "dhcpd_leasetime",
+        "domain_name",
+        "igmp_snooping",
+        "mdns_enabled",
+        "internet_access_enabled",
+    ]
+    return Prefix(
+        prefix=normalized,
+        scope_site=home_site or site(),
+        vlan=vlan_for_network(network, home_site),
+        status="active" if network.get("enabled", True) else "deprecated",
+        description=f"UniFi network {clean_name(network.get('name'))}",
+        comments=compact_json(filtered_metadata(network, safe_keys)),
+        tags=TAGS,
+        metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+    )
 
 
 def vlan_for_network(network, home_site=None):
@@ -300,6 +402,101 @@ def build_vlan_entities(networks, home_site):
     return entities, by_id
 
 
+def build_prefix_entities(networks, home_site):
+    entities = []
+    seen = set()
+    for network in networks:
+        prefix = prefix_for_network(network, home_site)
+        if prefix is None:
+            continue
+        key = prefix.prefix
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(Entity(prefix=prefix))
+    return entities
+
+
+def build_wan_circuit_entities(networks, home_site):
+    entities = []
+    seen_providers = set()
+    seen_circuits = set()
+    added_circuit_type = False
+    circuit_type = CircuitType(
+        name="Internet",
+        slug="internet",
+        color="2196f3",
+        description="Internet access circuit discovered from UniFi WAN settings",
+        tags=TAGS,
+        metadata={"source": APP_NAME},
+    )
+    for network in networks:
+        if network.get("purpose") != "wan":
+            continue
+        provider_name = clean_name(network.get("name"), network.get("wan_networkgroup"), "UniFi WAN")
+        provider = Provider(
+            name=provider_name,
+            slug=slugify(provider_name),
+            description="Provider inferred from UniFi WAN network",
+            tags=TAGS,
+            metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+        )
+        if provider_name not in seen_providers:
+            seen_providers.add(provider_name)
+            entities.append(Entity(provider=provider))
+        capabilities = network.get("wan_provider_capabilities") or {}
+        cid = clean_name(network.get("external_id"), network.get("_id"), provider_name)
+        if cid in seen_circuits:
+            continue
+        seen_circuits.add(cid)
+        circuit = Circuit(
+            cid=cid,
+            provider=provider,
+            type=circuit_type,
+            status="active" if network.get("enabled", True) else "offline",
+            commit_rate=capabilities.get("download_kilobits_per_second") or capabilities.get("upload_kilobits_per_second"),
+            description=f"UniFi WAN {provider_name}",
+            comments=compact_json(
+                filtered_metadata(
+                    network,
+                    [
+                        "purpose",
+                        "wan_networkgroup",
+                        "wan_type",
+                        "wan_ip",
+                        "wan_gateway",
+                        "wan_netmask",
+                        "wan_vlan",
+                        "wan_vlan_enabled",
+                        "wan_load_balance_type",
+                        "wan_load_balance_weight",
+                        "wan_failover_priority",
+                        "wan_smartq_enabled",
+                    ],
+                )
+                | {"wan_provider_capabilities": capabilities}
+            ),
+            tags=TAGS,
+            metadata=filtered_metadata(network, ["_id", "external_id", "site_id"]) | {"source": APP_NAME},
+        )
+        term = CircuitTermination(
+            circuit=circuit,
+            term_side="A",
+            termination_site=home_site,
+            port_speed=capabilities.get("download_kilobits_per_second"),
+            upstream_speed=capabilities.get("upload_kilobits_per_second"),
+            description=f"UniFi WAN termination for {provider_name}",
+            tags=TAGS,
+            metadata={"source": APP_NAME},
+        )
+        if not added_circuit_type:
+            entities.append(Entity(circuit_type=circuit_type))
+            added_circuit_type = True
+        entities.append(Entity(circuit=circuit))
+        entities.append(Entity(circuit_termination=term))
+    return entities
+
+
 def build_wireless_lan_entities(wlans, vlan_by_id, home_site):
     entities = []
     for wlan in wlans:
@@ -347,6 +544,8 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
     entities = [Entity(site=home_site)]
     vlan_entities, vlan_by_id = build_vlan_entities(networks, home_site)
     entities.extend(vlan_entities)
+    entities.extend(build_prefix_entities(networks, home_site))
+    entities.extend(build_wan_circuit_entities(networks, home_site))
     entities.extend(build_wireless_lan_entities(wlans, vlan_by_id, home_site))
 
     device_by_mac = {}
@@ -385,6 +584,16 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                         "sfp_part",
                         "sfp_serial",
                         "native_networkconf_id",
+                        "up",
+                        "speed",
+                        "max_speed",
+                        "full_duplex",
+                        "poe_power",
+                        "poe_voltage",
+                        "poe_class",
+                        "stp_state",
+                        "mac_table_count",
+                        "last_connection",
                     ],
                 )
                 | {"source": APP_NAME},
@@ -403,7 +612,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 speed=speed_kbps(uplink.get("speed") or uplink.get("max_speed")),
                 description="UniFi discovered uplink interface",
                 tags=TAGS,
-                metadata=filtered_metadata(uplink, ["port_idx", "uplink_mac", "uplink_device_name", "uplink_remote_port"]) | {"source": APP_NAME},
+                metadata=filtered_metadata(uplink, ["port_idx", "uplink_mac", "uplink_device_name", "uplink_remote_port", "uplink_source", "rx_errors", "tx_errors"]) | {"source": APP_NAME},
             )
             entities.append(Entity(interface=parent))
 
@@ -442,18 +651,89 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
             entities.append(Entity(mac_address=mac_obj))
         entities.append(Entity(device=device_obj))
 
+    entities.extend(build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx))
     entities.extend(build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx))
+    return entities
+
+
+def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx):
+    entities = []
+    seen = set()
+    for device in devices:
+        local_mac = normalize_mac(device.get("mac") or device.get("macAddress"))
+        for uplink in [device.get("uplink") or {}]:
+            remote_mac = normalize_mac(uplink.get("uplink_mac"))
+            local_port_idx = uplink.get("port_idx")
+            remote_port_idx = uplink.get("uplink_remote_port")
+            if not local_mac or not remote_mac or local_port_idx is None or remote_port_idx is None:
+                continue
+            local_iface = port_by_device_mac_and_idx.get((local_mac, local_port_idx))
+            remote_iface = port_by_device_mac_and_idx.get((remote_mac, remote_port_idx))
+            if not local_iface or not remote_iface:
+                continue
+            endpoint_key = tuple(sorted([(local_mac, local_port_idx), (remote_mac, remote_port_idx)]))
+            if endpoint_key in seen:
+                continue
+            seen.add(endpoint_key)
+            local_device = device_by_mac.get(local_mac)
+            remote_device = device_by_mac.get(remote_mac)
+            label = f"UniFi LLDP {local_device.name if local_device else local_mac} {local_iface.name} to {remote_device.name if remote_device else remote_mac} {remote_iface.name}"
+            cable = Cable(
+                type="Copper - Twisted Pair (UTP/STP)" if interface_type_for(uplink).endswith("base-t") else "Copper - Twinax (DAC)",
+                a_terminations=[GenericObject(object_interface=local_iface)],
+                b_terminations=[GenericObject(object_interface=remote_iface)],
+                status="connected" if uplink.get("up", True) else "planned",
+                label=label[:100],
+                description="Cable/link inferred from UniFi LLDP uplink data",
+                comments=compact_json(filtered_metadata(uplink, ["uplink_source", "speed", "full_duplex", "rx_errors", "tx_errors"])),
+                tags=TAGS,
+                metadata={"source": APP_NAME, "local_mac": local_mac, "remote_mac": remote_mac},
+            )
+            entities.append(Entity(cable=cable))
     return entities
 
 
 def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx):
     entities = []
+    include_devices = bool_env("UNIFI_INCLUDE_CLIENT_DEVICES", False)
     for client in clients:
         mac = normalize_mac(client.get("mac") or client.get("macAddress"))
         ip_address = ip_with_mask(client.get("ip") or client.get("ipAddress"))
         if not mac and not ip_address:
             continue
         client_name = clean_name(client.get("hostname"), client.get("name"), mac, client.get("_id"))
+        parent = port_by_device_mac_and_idx.get((normalize_mac(client.get("sw_mac") or client.get("last_uplink_mac")), client.get("sw_port") or client.get("last_uplink_remote_port")))
+        client_metadata = filtered_metadata(
+            client,
+            ["_id", "user_id", "mac", "network_id", "site_id", "network", "vlan", "is_wired", "sw_mac", "sw_port", "last_uplink_mac", "last_uplink_remote_port", "ap_mac", "essid"],
+        ) | {"source": APP_NAME, "attached_to_parent_interface": bool(parent)}
+        if not include_devices:
+            if mac:
+                entities.append(
+                    Entity(
+                        mac_address=MACAddress(
+                            mac_address=mac,
+                            description=f"UniFi observed client MAC for {client_name}",
+                            tags=TAGS,
+                            metadata=client_metadata,
+                        )
+                    )
+                )
+            if ip_address and ip_address not in seen_ips:
+                seen_ips.add(ip_address)
+                entities.append(
+                    Entity(
+                        ip_address=IPAddress(
+                            address=ip_address,
+                            status="active",
+                            description=f"UniFi observed client IP for {client_name}",
+                            comments=compact_json(client_metadata),
+                            tags=TAGS,
+                            metadata={"source": APP_NAME, "client_mac": mac},
+                        )
+                    )
+                )
+            continue
         client_device = Device(
             name=client_name,
             device_type=DeviceType(manufacturer=UNKNOWN, model="UniFi Client", slug="unifi-client"),
@@ -486,9 +766,8 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
                 )
             ),
             tags=TAGS,
-            metadata=filtered_metadata(client, ["_id", "user_id", "mac", "network_id", "site_id"]) | {"source": APP_NAME},
+            metadata=client_metadata,
         )
-        parent = port_by_device_mac_and_idx.get((normalize_mac(client.get("sw_mac") or client.get("last_uplink_mac")), client.get("sw_port") or client.get("last_uplink_remote_port")))
         iface = Interface(
             device=client_device,
             name="eth0" if client.get("is_wired") else "wlan0",
@@ -546,6 +825,7 @@ def collect_entities(api_key):
     clients = network_api_get(api_key, f"/api/s/{site_slug}/stat/sta")
     networks = network_api_get(api_key, f"/api/s/{site_slug}/rest/networkconf")
     wlans = network_api_get(api_key, f"/api/s/{site_slug}/rest/wlanconf")
+    device_type_import = ensure_device_types(devices)
     entities = build_device_entities(devices, networks, clients, wlans)
     return entities, {
         "devices": len(devices),
@@ -553,6 +833,7 @@ def collect_entities(api_key):
         "networks": len(networks),
         "wlans": len(wlans),
         "entities": len(entities),
+        "device_type_import": device_type_import,
     }
 
 
@@ -575,7 +856,8 @@ def main():
     print(
         "unifi discovery ingest succeeded "
         f"devices={counts['devices']} clients={counts['clients']} networks={counts['networks']} "
-        f"wlans={counts['wlans']} entities={counts['entities']} response={response!r}"
+        f"wlans={counts['wlans']} entities={counts['entities']} "
+        f"device_type_import={counts['device_type_import']} response={response!r}"
     )
 
 
