@@ -762,6 +762,7 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
     device_by_mac = {}
     port_by_device_mac_and_idx = {}
     seen_ips = set()
+    seen_macs = set()
 
     for device in devices:
         device_obj = make_device(device, home_site)
@@ -878,12 +879,16 @@ def build_device_entities(devices, networks, clients=None, wlans=None):
                 tags=TAGS,
                 metadata={"source": APP_NAME},
             )
-            entities.append(Entity(mac_address=mac_obj))
+            if device_mac not in seen_macs:
+                seen_macs.add(device_mac)
+                entities.append(Entity(mac_address=mac_obj))
+            else:
+                log_event("mac_address_skipped", reason="duplicate", mac=device_mac, owner=device_obj.name, owner_type="device")
         entities.append(Entity(device=device_obj))
 
     existing_cabled_interfaces = existing_cabled_interfaces_for_cables(devices, device_by_mac, port_by_device_mac_and_idx)
     entities.extend(build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, existing_cabled_interfaces))
-    entities.extend(build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx))
+    entities.extend(build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx, seen_macs))
     return entities
 
 
@@ -996,8 +1001,9 @@ def build_cable_entities(devices, device_by_mac, port_by_device_mac_and_idx, exi
     return entities
 
 
-def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx):
+def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_idx, seen_macs=None):
     entities = []
+    seen_macs = seen_macs if seen_macs is not None else set()
     include_devices = bool_env("UNIFI_INCLUDE_CLIENT_DEVICES", False)
     for client in clients:
         mac = normalize_mac(client.get("mac") or client.get("macAddress"))
@@ -1012,16 +1018,20 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
         ) | {"source": APP_NAME, "attached_to_parent_interface": bool(parent)}
         if not include_devices:
             if mac:
-                entities.append(
-                    Entity(
-                        mac_address=MACAddress(
-                            mac_address=mac,
-                            description=f"UniFi observed client MAC for {client_name}",
-                            tags=TAGS,
-                            metadata=client_metadata,
+                if mac not in seen_macs:
+                    seen_macs.add(mac)
+                    entities.append(
+                        Entity(
+                            mac_address=MACAddress(
+                                mac_address=mac,
+                                description=f"UniFi observed client MAC for {client_name}",
+                                tags=TAGS,
+                                metadata=client_metadata,
+                            )
                         )
                     )
-                )
+                else:
+                    log_event("mac_address_skipped", reason="duplicate", mac=mac, owner=client_name, owner_type="client")
             if ip_address and ip_address not in seen_ips:
                 seen_ips.add(ip_address)
                 entities.append(
@@ -1084,17 +1094,21 @@ def build_client_entities(clients, home_site, seen_ips, port_by_device_mac_and_i
         entities.append(Entity(device=client_device))
         entities.append(Entity(interface=iface))
         if mac:
-            entities.append(
-                Entity(
-                    mac_address=MACAddress(
-                        mac_address=mac,
-                        assigned_object_interface=iface,
-                        description=f"UniFi client MAC for {client_name}",
-                        tags=TAGS,
-                        metadata={"source": APP_NAME},
+            if mac not in seen_macs:
+                seen_macs.add(mac)
+                entities.append(
+                    Entity(
+                        mac_address=MACAddress(
+                            mac_address=mac,
+                            assigned_object_interface=iface,
+                            description=f"UniFi client MAC for {client_name}",
+                            tags=TAGS,
+                            metadata={"source": APP_NAME},
+                        )
                     )
                 )
-            )
+            else:
+                log_event("mac_address_skipped", reason="duplicate", mac=mac, owner=client_name, owner_type="client")
         if ip_address and ip_address not in seen_ips:
             seen_ips.add(ip_address)
             entities.append(
