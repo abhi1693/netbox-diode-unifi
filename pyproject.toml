@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-diode-unifi"
+version = "0.1.0"
+description = "UniFi Network API discovery collector for NetBox Diode"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "netboxlabs-diode-sdk==1.13.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+netbox-diode-unifi = "netbox_diode_unifi.discover:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
